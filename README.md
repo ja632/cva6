@@ -436,3 +436,118 @@ end
 | 🔁 更新 rename 中指令的 source | 目的：確保早期進入 rename buffer 的指令可以即時獲得最新的暫存器映射資訊 |
 | 📥 mem_cnt + / - | 為確保 buffer 不會溢位，透過計數器追蹤 rename buffer 使用量 |
 | 🔄 flush 清除條件 | 發生 mispredict 或 interrupt 等情況時，需清空 rename buffer 內容與指標 |
+
+
+---
+
+## 🧠 Rename Stage 子模組整理
+
+以下為 rename stage 中使用的三個關鍵模組說明：freelist、busytable、maptable。
+
+---
+
+### 🧾 `freelist`
+```systemverilog
+freelist #(
+    .CVA6Cfg ( CVA6Cfg )
+) i_freelist(
+    .clk_i, .rst_ni,
+    .flush_i,
+    .flush_unissied_instr_i,
+    .issue_instr_valid_i ( rename_instr_valid_i ),
+    .issue_ack_o          ( rename_ack_o ),
+    .no_rename_i          ( no_rename ),
+    .commit_instr_o       ( commit_instr_o ),
+    .commit_ack_i         ( commit_ack_i ),
+    .Pr_rd_o_rob          ( Pr_rd_o_rob ),
+    .br_instr_i           ( br_instr ),
+    .br_push_ptr          ( br_push_ptr ),
+    .br_pop_ptr           ( br_pop_ptr )
+);
+```
+#### 📌 功能：
+- 管理空閒的 **physical register (PRF)**
+- 提供給 map table 使用的寫入位址（`Pr_rd_o_rob`）
+- 若分支錯誤（mis-predict），可透過 `br_push_ptr` 和 `br_pop_ptr` 回收對應 snapshot 中的暫存器
+- 支援 flush 功能，清空目前 rename 中尚未發出的 rename 結果
+
+---
+
+### 🧾 `busytable`
+```systemverilog
+busytable #(
+    .CVA6Cfg ( CVA6Cfg )
+) i_busytable(
+    .clk_i, .rst_ni,
+    .flush_i,
+    .flush_unissied_instr_i,
+    .issue_instr_i        ( rename_instr_i ),
+    .issue_instr_valid_i  ( rename_instr_valid_i ),
+    .issue_ack_o          ( rename_ack_o ),
+    .no_rename_i          ( no_rename ),
+    .commit_instr_o       ( commit_instr_o ),
+    .commit_ack_i         ( commit_ack_i ),
+    .Pr_rd_o_rob          ( Pr_rd_o_rob ),
+    .Pr_rs1_o             ( Pr_rs1_o ),
+    .Pr_rs2_o             ( Pr_rs2_o ),
+    .Pr_rs3_o             ( Pr_rs3_o ),
+    .Pr_rs1_o_rob         ( Pr_rs1_o_rob ),
+    .Pr_rs2_o_rob         ( Pr_rs2_o_rob ),
+    .Pr_rs3_o_rob         ( Pr_rs3_o_rob ),
+    .br_instr_i           ( br_instr ),
+    .br_push_ptr          ( br_push_ptr ),
+    .br_pop_ptr           ( br_pop_ptr )
+);
+```
+#### 📌 功能：
+- 管理 physical register 的 **忙碌狀態（busy bit）**
+- 發出給 Issue 單元使用的 ready 判斷依據
+- 控制 `rs1/rs2/rs3` 是否可從 PRF 讀值
+- 支援 rollback snapshot，針對分支錯誤的暫存器狀態復原
+
+---
+
+### 🧾 `maptable`
+```systemverilog
+maptable #(
+    .CVA6Cfg ( CVA6Cfg )
+) i_maptable(
+    .clk_i, .rst_ni,
+    .flush_i,
+    .flush_unissied_instr_i,
+    .issue_instr_i         ( rename_instr_i ),
+    .issue_instr_valid_i   ( rename_instr_valid_i ),
+    .issue_ack_o           ( rename_ack_o ),
+    .no_rename_i           ( no_rename ),
+    .commit_instr_o        ( commit_instr_o ),
+    .commit_ack_i          ( commit_ack_i ),
+    .Pr_rd_o_rob           ( Pr_rd_o_rob ),
+    .physical_waddr_i      ( physical_waddr_i ),
+    .Pr_rs1_o              ( Pr_rs1_o ),
+    .Pr_rs2_o              ( Pr_rs2_o ),
+    .Pr_rs3_o              ( Pr_rs3_o ),
+    .virtual_waddr_o       ( virtual_waddr_o ),
+    .virtual_waddr_valid   ( virtual_waddr_valid ),
+    .rs1_physical_i        ( rs1_physical_i ),
+    .rs2_physical_i        ( rs2_physical_i ),
+    .rs3_physical_i        ( rs3_physical_i ),
+    .rs1_virtual_o         ( rs1_virtual_o ),
+    .rs2_virtual_o         ( rs2_virtual_o ),
+    .rs3_virtual_o         ( rs3_virtual_o ),
+    .br_instr_i            ( br_instr ),
+    .br_push_ptr           ( br_push_ptr ),
+    .br_pop_ptr            ( br_pop_ptr )
+);
+```
+#### 📌 功能：
+- 實作 register renaming 對應：`ARF -> PRF`
+- 寫入時給出新的 `virtual_waddr` 與 `Pr_rd`
+- 同時也維護 snapshot 結構支援分支復原
+- 提供對應 `rs1/rs2/rs3` 的映射結果給後段（如 issue stage）使用
+
+---
+
+👉 這三個模組是整個 Tomasulo 架構中 rename/dispatch 的關鍵支柱，用來維持資料一致性、資源管理，以及支援精確例外與分支回復。
+
+
+
