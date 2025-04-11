@@ -549,5 +549,83 @@ maptable #(
 
 👉 這三個模組是整個 Tomasulo 架構中 rename/dispatch 的關鍵支柱，用來維持資料一致性、資源管理，以及支援精確例外與分支回復。
 
+---
 
+## 🧪 Rename Entry 生成與資料寫入
+
+這段邏輯主要負責將 ID 階段解碼後的 `scoreboard_entry_t` 進行目的暫存器映射、來源暫存器讀出對應實體暫存器值後，封裝成 `rename_entry` 發送給後續發射階段。
+
+```systemverilog
+// -------------------------------------------
+// 將原始欄位直接傳遞到 rename_entry
+// -------------------------------------------
+assign rename_entry[0].pc             = rename_instr_i[0].pc;
+assign rename_entry[0].trans_id       = rename_instr_i[0].trans_id;
+assign rename_entry[0].fu             = rename_instr_i[0].fu;
+assign rename_entry[0].op             = rename_instr_i[0].op;
+assign rename_entry[0].use_imm        = rename_instr_i[0].use_imm;
+assign rename_entry[0].valid          = rename_instr_i[0].valid;
+assign rename_entry[0].use_zimm       = rename_instr_i[0].use_zimm;
+assign rename_entry[0].use_pc         = rename_instr_i[0].use_pc;
+assign rename_entry[0].ex             = rename_instr_i[0].ex;
+assign rename_entry[0].bp             = rename_instr_i[0].bp;
+assign rename_entry[0].is_compressed  = rename_instr_i[0].is_compressed;
+assign rename_entry[0].vfp            = rename_instr_i[0].vfp;
+assign rename_entry[0].rs1_rdata      = rename_instr_i[0].rs1_rdata;
+assign rename_entry[0].rs2_rdata      = rename_instr_i[0].rs2_rdata;
+assign rename_entry[0].lsu_addr       = rename_instr_i[0].lsu_addr;
+assign rename_entry[0].lsu_rmask      = rename_instr_i[0].lsu_rmask;
+assign rename_entry[0].lsu_wmask      = rename_instr_i[0].lsu_wmask;
+assign rename_entry[0].lsu_wdata      = rename_instr_i[0].lsu_wdata;
+assign rename_entry[0].rd             = (no_rename[0]) ? rename_instr_i[0].rd : {1'b0, Pr_rd_o_rob[0]};
+
+// 處理 rs1 實體對應邏輯
+always_comb begin 
+    rename_entry[0].rs1 = '0;
+    if (rs1_no_rename[0]) begin
+        rename_entry[0].rs1 = {1'd1, rename_instr_i[0].rs1};
+    end else if ((virtual_waddr_o[0] == rename_instr_i[0].rs1) && commit_ack_i[0] && virtual_waddr_valid[0] &&
+                ((is_rs1_fpr(rename_instr_i[0].op) && we_fpr_i[0]) || (!is_rs1_fpr(rename_instr_i[0].op) && !we_fpr_i[0]))) begin
+        rename_entry[0].rs1 = {1'd1, virtual_waddr_o[0][REG_ADDR_SIZE-2:0]};
+    end else if ((virtual_waddr_o[1] == rename_instr_i[0].rs1) && commit_ack_i[1] && virtual_waddr_valid[1] &&
+                ((is_rs1_fpr(rename_instr_i[0].op) && we_fpr_i[1]) || (!is_rs1_fpr(rename_instr_i[0].op) && !we_fpr_i[1]))) begin
+        rename_entry[0].rs1 = {1'd1, virtual_waddr_o[1][REG_ADDR_SIZE-2:0]};
+    end else begin
+        rename_entry[0].rs1 = Pr_rs1_o_rob[0];
+    end
+end
+
+// 處理 rs2 實體對應邏輯
+always_comb begin 
+    rename_entry[0].rs2 = '0;
+    if ((virtual_waddr_o[0] == rename_instr_i[0].rs2) && commit_ack_i[0] && virtual_waddr_valid[0] &&
+        ((is_rs2_fpr(rename_instr_i[0].op) && we_fpr_i[0]) || (!is_rs2_fpr(rename_instr_i[0].op) && !we_fpr_i[0]))) begin
+        rename_entry[0].rs2 = {1'd1, virtual_waddr_o[0][REG_ADDR_SIZE-2:0]};
+    end else if ((virtual_waddr_o[1] == rename_instr_i[0].rs2) && commit_ack_i[1] && virtual_waddr_valid[1] &&
+        ((is_rs2_fpr(rename_instr_i[0].op) && we_fpr_i[1]) || (!is_rs2_fpr(rename_instr_i[0].op) && !we_fpr_i[1]))) begin
+        rename_entry[0].rs2 = {1'd1, virtual_waddr_o[1][REG_ADDR_SIZE-2:0]};
+    end else begin
+        rename_entry[0].rs2 = Pr_rs2_o_rob[0];
+    end
+end
+
+// 若 result 欄位為立即數浮點暫存器位址，也需要進行更新
+always_comb begin 
+    if (is_imm_fpr(rename_instr_i[0].op)) begin
+        if ((virtual_waddr_o[0] == {1'd0, rename_instr_i[0].result[REG_ADDR_SIZE-2:0]}) && commit_ack_i[0] && virtual_waddr_valid[0] && we_fpr_i[0]) begin
+            rename_entry[0].result = {58'd0, 1'd1, virtual_waddr_o[0][REG_ADDR_SIZE-2:0]};
+        end else if ((virtual_waddr_o[1] == {1'd0, rename_instr_i[0].result[REG_ADDR_SIZE-2:0]}) && commit_ack_i[1] && virtual_waddr_valid[1] && we_fpr_i[1]) begin
+            rename_entry[0].result = {58'd0, 1'd1, virtual_waddr_o[1][REG_ADDR_SIZE-2:0]};
+        end else begin
+            rename_entry[0].result = {58'd0, Pr_rs3_o_rob[0]};
+        end
+    end else begin
+        rename_entry[0].result = rename_instr_i[0].result;
+    end
+end
+```
+
+---
+
+✅ 這段程式碼可讓 rename_entry[0] 完整映射 rename 後的結果，正確傳遞給後續 issue stage。
 
