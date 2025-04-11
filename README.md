@@ -349,3 +349,90 @@ end
 
 ---
 
+---
+
+## 🌀 同步更新 Rename Buffer 內容（Commit 後回寫 RS）
+
+這段程式碼實現了：
+- 當指令 commit（送出）後，若其寫入的目的暫存器是其他指令的來源 rs1/rs2，則**同步更新那些等待中的指令在 rename buffer 裡的 rs1/rs2** 值。
+- 避免使用過時的虛擬暫存器別名（physical register aliasing）。
+
+```systemverilog
+for (int unsigned j = 0; j < CVA6Cfg.Nrrename; j++) begin 
+    // ---------- rs1 更新 ----------
+    if ((commit_instr_o[0].rd == rename_data_q[j].data.rs1) && commit_ack_i[0] && rename_data_q[j].valid && !rename_data_q[j].no_rename_rs1 &&
+        ((is_rs1_fpr(rename_data_q[j].data.op) && we_fpr_i[0]) ||
+         ((commit_instr_o[0].rd != '0) && !is_rs1_fpr(rename_data_q[j].data.op) && !we_fpr_i[0]))) begin 
+        rename_data_n[j].data.rs1 = {1'd1, virtual_waddr_o[0][REG_ADDR_SIZE-2:0]};
+    end else if ((commit_instr_o[1].rd == rename_data_q[j].data.rs1) && commit_ack_i[1] && rename_data_q[j].valid && !rename_data_q[j].no_rename_rs1 &&
+                 ((is_rs1_fpr(rename_data_q[j].data.op) && we_fpr_i[1]) ||
+                  ((commit_instr_o[1].rd != '0) && !is_rs1_fpr(rename_data_q[j].data.op) && !we_fpr_i[1]))) begin
+        rename_data_n[j].data.rs1 = {1'd1, virtual_waddr_o[1][REG_ADDR_SIZE-2:0]};
+    end
+
+    // ---------- rs2 更新 ----------
+    if ((commit_instr_o[0].rd == rename_data_q[j].data.rs2) && commit_ack_i[0] && rename_data_q[j].valid &&
+        ((is_rs2_fpr(rename_data_q[j].data.op) && we_fpr_i[0]) ||
+         ((commit_instr_o[0].rd != '0) && !is_rs2_fpr(rename_data_q[j].data.op) && !we_fpr_i[0]))) begin 
+        rename_data_n[j].data.rs2 = {1'd1, virtual_waddr_o[0][REG_ADDR_SIZE-2:0]};
+    end else if ((commit_instr_o[1].rd == rename_data_q[j].data.rs2) && commit_ack_i[1] && rename_data_q[j].valid &&
+                 ((is_rs2_fpr(rename_data_q[j].data.op) && we_fpr_i[1]) ||
+                  ((commit_instr_o[1].rd != '0) && !is_rs2_fpr(rename_data_q[j].data.op) && !we_fpr_i[1]))) begin
+        rename_data_n[j].data.rs2 = {1'd1, virtual_waddr_o[1][REG_ADDR_SIZE-2:0]};
+    end
+
+    // ---------- 特殊: result 欄位用來存放浮點 immediate 寫入值 ----------
+    if (is_imm_fpr(rename_data_q[j].data.op)) begin 
+        if ((commit_instr_o[0].rd == rename_data_q[j].data.result[5:0]) && commit_ack_i[0] && rename_data_q[j].valid && we_fpr_i[0]) begin 
+            rename_data_n[j].data.result = {58'd0, 1'd1, virtual_waddr_o[0][REG_ADDR_SIZE-2:0]};
+        end else if ((commit_instr_o[1].rd == rename_data_q[j].data.result[5:0]) && commit_ack_i[1] && rename_data_q[j].valid && we_fpr_i[1]) begin
+            rename_data_n[j].data.result = {58'd0, 1'd1, virtual_waddr_o[1][REG_ADDR_SIZE-2:0]};
+        end 
+    end
+end
+
+// -------- Flush 條件下清空 FIFO --------
+if (flush_i | flush_unissied_instr_i) begin 
+    for (int unsigned i = 0; i < CVA6Cfg.Nrrename; i++) begin
+        rename_data_n[i].valid = 1'b0;
+    end
+end
+```
+
+---
+
+## 🧠 寄存器（always_ff）區塊
+
+這段程式碼描述 rename buffer 與相關指標的寄存器邏輯：
+- 當 flush 產生時重設
+- 否則更新指標與記錄內容
+
+```systemverilog
+always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (~rst_ni) begin 
+        mem_cnt             <= '0;
+        rename_data_q       <= '0;
+        issue_pointer_q     <= '0;
+        commit_pointer_q    <= '0;
+    end else if (flush_i | flush_unissied_instr_i) begin 
+        mem_cnt             <= '0;
+        rename_data_q       <= '0;
+        issue_pointer_q     <= '0;
+        commit_pointer_q    <= '0;
+    end else begin    
+        rename_data_q       <= rename_data_n;
+        issue_pointer_q     <= issue_pointer_n;
+        commit_pointer_q    <= commit_pointer_n;
+        mem_cnt             <= mem_cnt + issue_num - commit_num;
+    end
+end
+```
+
+---
+
+### 🔍 小結
+| 機制 | 說明 |
+|------|------|
+| 🔁 更新 rename 中指令的 source | 目的：確保早期進入 rename buffer 的指令可以即時獲得最新的暫存器映射資訊 |
+| 📥 mem_cnt + / - | 為確保 buffer 不會溢位，透過計數器追蹤 rename buffer 使用量 |
+| 🔄 flush 清除條件 | 發生 mispredict 或 interrupt 等情況時，需清空 rename buffer 內容與指標 |
