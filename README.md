@@ -629,3 +629,84 @@ end
 
 ✅ 這段程式碼可讓 rename_entry[0] 完整映射 rename 後的結果，正確傳遞給後續 issue stage。
 
+### rename_entry[1]
+```systemverilog
+assign rename_entry[1].pc             = rename_instr_i[1].pc;
+assign rename_entry[1].trans_id       = rename_instr_i[1].trans_id;
+assign rename_entry[1].fu             = rename_instr_i[1].fu;
+assign rename_entry[1].op             = rename_instr_i[1].op;
+assign rename_entry[1].use_imm        = rename_instr_i[1].use_imm;
+assign rename_entry[1].valid          = rename_instr_i[1].valid;
+assign rename_entry[1].use_zimm       = rename_instr_i[1].use_zimm;
+assign rename_entry[1].use_pc         = rename_instr_i[1].use_pc;
+assign rename_entry[1].ex             = rename_instr_i[1].ex;
+assign rename_entry[1].bp             = rename_instr_i[1].bp;
+assign rename_entry[1].is_compressed  = rename_instr_i[1].is_compressed;
+assign rename_entry[1].vfp            = rename_instr_i[1].vfp;
+assign rename_entry[1].rs1_rdata      = rename_instr_i[1].rs1_rdata;
+assign rename_entry[1].rs2_rdata      = rename_instr_i[1].rs2_rdata;
+assign rename_entry[1].lsu_addr       = rename_instr_i[1].lsu_addr;
+assign rename_entry[1].lsu_rmask      = rename_instr_i[1].lsu_rmask;
+assign rename_entry[1].lsu_wmask      = rename_instr_i[1].lsu_wmask;
+assign rename_entry[1].lsu_wdata      = rename_instr_i[1].lsu_wdata;
+assign rename_entry[1].rd             = (no_rename[1]) ? rename_instr_i[1].rd : {1'b0, Pr_rd_o_rob[1]};
+
+// 處理 rs1 映射（避免與 rename[0] 發生寫後讀衝突）
+always_comb begin 
+    rename_entry[1].rs1 = '0;
+    if (rs1_no_rename[1]) begin
+        rename_entry[1].rs1 = {1'd1, rename_instr_i[1].rs1[REG_ADDR_SIZE-2:0]};
+    end else if ((virtual_waddr_o[0] == rename_instr_i[1].rs1) && commit_ack_i[0] && virtual_waddr_valid[0] &&
+                !((virtual_waddr_o[0] == rename_instr_i[0].rd) && ((is_rs1_fpr(rename_instr_i[1].op)) == is_rd_fpr(rename_instr_i[0].op)) && !no_rename[0]) &&
+                ((is_rs1_fpr(rename_instr_i[1].op) && we_fpr_i[0]) || (!is_rs1_fpr(rename_instr_i[1].op) && !we_fpr_i[0]))) begin
+        rename_entry[1].rs1 = {1'd1, virtual_waddr_o[0][REG_ADDR_SIZE-2:0]};
+    end else if ((virtual_waddr_o[1] == rename_instr_i[1].rs1) && commit_ack_i[1] && virtual_waddr_valid[1] &&
+                !((virtual_waddr_o[1] == rename_instr_i[0].rd) && ((is_rs1_fpr(rename_instr_i[1].op)) == is_rd_fpr(rename_instr_i[0].op)) && !no_rename[0]) &&
+                ((is_rs1_fpr(rename_instr_i[1].op) && we_fpr_i[1]) || (!is_rs1_fpr(rename_instr_i[1].op) && !we_fpr_i[1]))) begin
+        rename_entry[1].rs1 = {1'd1, virtual_waddr_o[1][REG_ADDR_SIZE-2:0]};
+    end else begin
+        rename_entry[1].rs1 = Pr_rs1_o_rob[1];
+    end
+end
+
+// 處理 rs2 映射（避免與 rename[0] 發生寫後讀衝突）
+always_comb begin 
+    rename_entry[1].rs2 = '0;
+    if ((virtual_waddr_o[0] == rename_instr_i[1].rs2) && commit_ack_i[0] && virtual_waddr_valid[0] &&
+        !((virtual_waddr_o[0] == rename_instr_i[0].rd) && ((is_rs2_fpr(rename_instr_i[1].op)) == is_rd_fpr(rename_instr_i[0].op)) && !no_rename[0]) &&
+        ((is_rs2_fpr(rename_instr_i[1].op) && we_fpr_i[0]) || (!is_rs2_fpr(rename_instr_i[1].op) && !we_fpr_i[0]))) begin
+        rename_entry[1].rs2 = {1'd1, virtual_waddr_o[0][REG_ADDR_SIZE-2:0]};
+    end else if ((virtual_waddr_o[1] == rename_instr_i[1].rs2) && commit_ack_i[1] && virtual_waddr_valid[1] &&
+        !((virtual_waddr_o[1] == rename_instr_i[0].rd) && ((is_rs2_fpr(rename_instr_i[1].op)) == is_rd_fpr(rename_instr_i[0].op)) && !no_rename[0]) &&
+        ((is_rs2_fpr(rename_instr_i[1].op) && we_fpr_i[1]) || (!is_rs2_fpr(rename_instr_i[1].op) && !we_fpr_i[1]))) begin
+        rename_entry[1].rs2 = {1'd1, virtual_waddr_o[1][REG_ADDR_SIZE-2:0]};
+    end else begin
+        rename_entry[1].rs2 = Pr_rs2_o_rob[1];
+    end
+
+    if (rename_entry[1].fu == 4'd6) begin
+        rename_entry[1].rs2 = '0;
+    end
+end
+
+// 處理浮點立即數（例如 fmv.x.w）目的暫存器為 rs3 的情況
+always_comb begin 
+    if (is_imm_fpr(rename_instr_i[1].op)) begin
+        if ((virtual_waddr_o[0] == {1'd0, rename_instr_i[1].result[REG_ADDR_SIZE-2:0]}) && commit_ack_i[0] && virtual_waddr_valid[0] &&
+            !((virtual_waddr_o[0] == rename_instr_i[0].rd) && ((is_imm_fpr(rename_instr_i[1].op)) == is_rd_fpr(rename_instr_i[0].op)) && !no_rename[0]) && we_fpr_i[0]) begin
+            rename_entry[1].result = {58'd0, 1'd1, virtual_waddr_o[0][REG_ADDR_SIZE-2:0]};
+        end else if ((virtual_waddr_o[1] == {1'd0, rename_instr_i[1].result[REG_ADDR_SIZE-2:0]}) && commit_ack_i[1] && virtual_waddr_valid[1] &&
+            !((virtual_waddr_o[1] == rename_instr_i[0].rd) && ((is_imm_fpr(rename_instr_i[1].op)) == is_rd_fpr(rename_instr_i[0].op)) && !no_rename[0]) && we_fpr_i[1]) begin
+            rename_entry[1].result = {58'd0, 1'd1, virtual_waddr_o[1][REG_ADDR_SIZE-2:0]};
+        end else begin
+            rename_entry[1].result = {58'd0, Pr_rs3_o_rob[1]};
+        end
+    end else begin
+        rename_entry[1].result = rename_instr_i[1].result;
+    end
+end
+```
+
+---
+
+✅ `rename_entry[1]` 處理的重點在於避免與前一條 rename_entry[0] 發生 RAW hazard，同時針對浮點立即數進行轉換處理。
