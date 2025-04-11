@@ -187,4 +187,90 @@ assign issue_full = (id_ins_num > 5'd16);
 
 ---
 
-> ✨ 若需進一步筆記包含 rename buffer 或 maptable 的實作細節，請讓我知道，我可以幫你擴寫筆記或畫流程圖。
+## 🧠 Rename Stage - Rename FIFO 與暫存器指標解釋
+
+```systemverilog
+localparam int unsigned MEM_ENTRY_BIT = $clog2(CVA6Cfg.Nrrename);
+localparam int unsigned BRENTRY_BIT   = $clog2(16);
+```
+- `MEM_ENTRY_BIT`：根據 rename buffer 大小 `Nrrename`，計算需要多少位元來編址。
+- `BRENTRY_BIT`：Branch snapshot buffer 固定支援 16 個 entries。
+
+```systemverilog
+typedef struct packed {
+    logic                           valid; 
+    logic                           no_rename_rs1; 
+    logic                           is_ctrl_flow; 
+    ariane_pkg::scoreboard_entry_t  data;
+} rename_mem_t;
+```
+- `rename_mem_t` 是儲存在 rename FIFO 的每筆資料：是否有效、是否需要 rename rs1、是否為控制流程、指令資訊。
+
+```systemverilog
+rename_mem_t [CVA6Cfg.Nrrename-1:0] rename_data_q, rename_data_n;
+```
+- 實際 rename FIFO：一組寄存器與 combinational buffer。
+
+---
+
+## 🧾 Rename 處理用的輔助訊號
+
+```systemverilog
+// 實體與虛擬 register 映射的結果 (由 maptable / busytable / freelist 輸入或輸出)
+ariane_pkg::scoreboard_entry_t  [CVA6Cfg.NrissuePorts-1:0]  rename_entry;
+logic [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-2:0]         Pr_rd_o_rob;
+logic [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-1:0]         Pr_rs1_o;
+logic [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-1:0]         Pr_rs2_o;
+logic [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-1:0]         Pr_rs3_o;
+logic [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-1:0]         Pr_rs1_o_rob;
+logic [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-1:0]         Pr_rs2_o_rob;
+logic [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-1:0]         Pr_rs3_o_rob;
+```
+- 這些訊號對應到 physical register allocator 結果，供後續指令 operand 依據進行 mapping。
+
+```systemverilog
+logic [CVA6Cfg.NrissuePorts-1:0]                            no_rename;
+logic [CVA6Cfg.NrissuePorts-1:0]                            br_instr;
+logic [CVA6Cfg.NrissuePorts-1:0]                            is_csr_imm;
+logic [CVA6Cfg.NrissuePorts-1:0]                            rs1_no_rename;
+logic [CVA6Cfg.NrissuePorts-1:0]                            virtual_waddr_valid;
+logic [CVA6Cfg.NrissuePorts-1:0]                            rd_0_no_rename;
+```
+- 控制相關旗標：判斷哪些 register 要 rename、是否為分支、是否 CSR 使用立即值、不需 rename rs1、rd 為 x0 等。
+
+```systemverilog
+logic [MEM_ENTRY_BIT-1:0] issue_pointer_n, issue_pointer_q;
+logic [MEM_ENTRY_BIT-1:0] commit_pointer_n, commit_pointer_q;
+logic [MEM_ENTRY_BIT-1:0] issue_num, commit_num;
+logic [BRENTRY_BIT-1:0]   br_push_ptr, br_pop_ptr;
+logic [MEM_ENTRY_BIT:0]   mem_cnt;
+logic                    mem_full;
+```
+- rename FIFO 的指標與狀態管理，控制資料 push/pop。
+
+---
+
+## 🚦 Rename Stage 發送與回傳（Handshake 與輸出）
+
+```systemverilog
+assign mem_full = ((mem_cnt-issue_ack_i[0]-issue_ack_i[1])>3'd1);
+```
+- 檢查 rename FIFO 是否接近滿（保守策略，留 1 筆空間）。
+
+```systemverilog
+assign rs1_no_rename[0] = (is_csr_use_imm(rename_instr_i[0].op) & rename_instr_i[0].use_zimm);
+assign rs1_no_rename[1] = (is_csr_use_imm(rename_instr_i[1].op) & rename_instr_i[1].use_zimm);
+```
+- 如果是 CSR 且使用 zimm，代表 rs1 無需被 rename。
+
+```systemverilog
+assign issue_instr_o[0] = rename_data_q[commit_pointer_q].data;
+assign issue_instr_valid_o[0] = rename_data_q[commit_pointer_q].valid;
+assign is_ctrl_flow_o[0] = rename_data_q[commit_pointer_q].is_ctrl_flow;
+assign issue_instr_o[1] = rename_data_q[commit_pointer_q+2'd1].data;
+assign issue_instr_valid_o[1] = rename_data_q[commit_pointer_q+2'd1].valid;
+assign is_ctrl_flow_o[1] = rename_data_q[commit_pointer_q+2'd1].is_ctrl_flow;
+```
+- rename FIFO 送出對應資料給 issue stage，透過 `commit_pointer_q` 指標取資料。
+
+---
