@@ -120,3 +120,71 @@ assign dual_fetch = ((id_ins_num - issue_instr_ack_i[0] - issue_instr_ack_i[1]) 
 // 決定是否已滿，不允許再放入
 assign issue_full = (id_ins_num > 5'd16);
 
+## 🧠 `re_name` 模組概觀（Register Renaming Stage）
+
+`re_name` 是 CVA6 中負責將解碼後的虛擬暫存器映射至實體暫存器的模組，支援 dual-issue 和 Tomasulo 架構。
+
+---
+
+### 📥 輸入介面
+| Port 名稱 | 資料型別 | 說明 |
+|-----------|-----------|------|
+| `clk_i` / `rst_ni` | `logic` | 時脈與非同步重置信號 |
+| `flush_i` | `logic` | flush pipeline 中所有資料 |
+| `flush_unissied_instr_i` | `logic` | 清除尚未送出至 issue 的指令（如分支錯誤） |
+
+### 🔁 來自 ID 階段的資料
+| Port 名稱 | 說明 |
+|-----------|------|
+| `rename_instr_i` | 解碼後的 scoreboard entry（指令資訊） |
+| `rename_instr_valid_i` | 該筆指令是否有效 |
+| `rename_ack_o` | 回應 ID 是否接收成功 |
+| `is_ctrl_flow_i` | 是否為控制流程指令（例如 branch、jump） |
+
+### 📤 輸出到 Issue 階段
+| Port 名稱 | 說明 |
+|-----------|------|
+| `issue_instr_o` | 已完成 renaming 的指令資訊 |
+| `issue_instr_valid_o` | 該筆輸出指令是否有效 |
+| `issue_ack_i` | issue stage 是否成功接收 |
+| `is_ctrl_flow_o` | 是否為控制流程指令 |
+
+### ✅ Commit 資訊（釋放實體暫存器）
+| Port 名稱 | 說明 |
+|-----------|------|
+| `commit_instr_o` | Commit 完成的指令（供 rename buffer 清除） |
+| `commit_ack_i` | Commit 確認訊號 |
+| `physical_waddr_i` | 要釋放的實體目的暫存器（從 commit 來） |
+| `virtual_waddr_o` | 對應釋放的虛擬目的暫存器（傳給 map table） |
+
+### 📥 Operand 映射
+| Port 名稱 | 說明 |
+|-----------|------|
+| `rs1_physical_i` / `rs2_physical_i` / `rs3_physical_i` | operand 實體暫存器編號（由 map table 提供） |
+| `rs1_virtual_o` / `rs2_virtual_o` / `rs3_virtual_o` | operand 對應的虛擬編號（供 forwarding 使用） |
+
+### ⛳ 分支處理相關
+| Port 名稱 | 說明 |
+|-----------|------|
+| `target_branch_addr_i` | 分支預測目標地址 |
+| `mispredict_pc` | 錯誤分支對應 PC |
+| `resolve_branch_i` | 宣告某個分支已 resolve（即使預測錯） |
+| `mispredict_branch_i` | 該分支是否為錯誤預測 |
+
+### 🧮 浮點運算支援
+| Port 名稱 | 說明 |
+|-----------|------|
+| `we_fpr_i` | 對應 commit port 是否寫回浮點暫存器 |
+
+---
+
+### 🔗 Rename 功能涵蓋元件（內部）
+- `maptable`：建立虛實映射
+- `busytable`：追蹤哪些實體暫存器仍在使用中
+- `freelist`：管理空閒的實體暫存器（供分配）
+- `rename buffer`：暫存已 rename、等待 issue 的指令資訊
+- `br_tag memory`：儲存分支快照，用於 rollback
+
+---
+
+> ✨ 若需進一步筆記包含 rename buffer 或 maptable 的實作細節，請讓我知道，我可以幫你擴寫筆記或畫流程圖。
