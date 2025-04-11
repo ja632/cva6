@@ -57,12 +57,13 @@ typedef struct packed {
 RVFI 是 RISC-V Formal Interface 的縮寫
 
 ## 🧾 fetch_entry_t 結構說明
+```
 typedef struct packed {
   logic [riscv::VLEN-1:0] address;
   logic [31:0] instruction;
   branchpredict_sbe_t     branch_predict;
   exception_t             ex;
-} fetch_entry_t;
+} fetch_entry_t;```
 
 欄位名稱	資料型態	說明
 address	logic [riscv::VLEN-1:0]	該指令的虛擬地址，代表其在記憶體中的位置。通常來源為 I-Cache or Frontend PC。
