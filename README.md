@@ -55,3 +55,17 @@ typedef struct packed {
 | `vfp`            | `logic`                                  | 是否為向量浮點運算指令 |
 
 RVFI 是 RISC-V Formal Interface 的縮寫
+
+## 🧾 fetch_entry_t 結構說明
+typedef struct packed {
+  logic [riscv::VLEN-1:0] address;
+  logic [31:0] instruction;
+  branchpredict_sbe_t     branch_predict;
+  exception_t             ex;
+} fetch_entry_t;
+
+欄位名稱	資料型態	說明
+address	logic [riscv::VLEN-1:0]	該指令的虛擬地址，代表其在記憶體中的位置。通常來源為 I-Cache or Frontend PC。
+instruction	logic [31:0]	指令內容本身，是已經過 re-align 的 32-bit 指令（即使是壓縮指令也會展開成 32-bit）。
+branch_predict	branchpredict_sbe_t	此指令的分支預測資訊，包含是否預測為分支、預測目標地址等。是 branch prediction 單元（例如 BTB/BHT）產出的結果。
+ex	exception_t	指令在取指階段（如 page fault、access fault）所發生的例外。用於確保指令執行時能正確處理 earlier exceptions。
