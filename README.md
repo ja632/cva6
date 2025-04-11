@@ -119,7 +119,7 @@ assign dual_fetch = ((id_ins_num - issue_instr_ack_i[0] - issue_instr_ack_i[1]) 
 
 // 決定是否已滿，不允許再放入
 assign issue_full = (id_ins_num > 5'd16);
-
+```
 ## 🧠 `re_name` 模組概觀（Register Renaming Stage）
 
 `re_name` 是 CVA6 中負責將解碼後的虛擬暫存器映射至實體暫存器的模組，支援 dual-issue 和 Tomasulo 架構。
