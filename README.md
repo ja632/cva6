@@ -274,3 +274,78 @@ assign is_ctrl_flow_o[1] = rename_data_q[commit_pointer_q+2'd1].is_ctrl_flow;
 - rename FIFO 送出對應資料給 issue stage，透過 `commit_pointer_q` 指標取資料。
 
 ---
+
+
+---
+
+## 🔁 Rename FIFO 控制邏輯（always_comb）
+
+這段程式碼描述 rename stage 的 FIFO 操作邏輯，包括：
+- 指令發送至 issue stage 時如何出隊
+- 指令從 ID stage 進入 rename FIFO 的條件與行為
+
+```systemverilog
+always_comb begin
+    rename_data_n             = rename_data_q;          // 預設保持不變
+    issue_pointer_n           = issue_pointer_q;
+    commit_pointer_n          = commit_pointer_q;
+    rename_ack_o              = 2'd0;                   // 預設不發出 ack
+    issue_num                 = 2'd0;                   // 預設不計入新進指令
+    commit_num                = 2'd0;                   // 預設不計入已送出指令
+
+    // ========================================================================
+    // ❶ 將已經 rename 完畢的指令發送給 issue stage（由 commit_pointer_q 指向）
+    // ========================================================================
+    if (issue_ack_i[0] & issue_ack_i[1]) begin 
+        rename_data_n[commit_pointer_q     ].valid          = 1'b0;
+        rename_data_n[commit_pointer_q     ].no_rename_rs1  = 1'b0;
+        rename_data_n[commit_pointer_q+2'd1].valid          = 1'b0;
+        rename_data_n[commit_pointer_q+2'd1].no_rename_rs1  = 1'b0;
+        commit_pointer_n                                    = commit_pointer_n + 3'd2;
+        commit_num                                          = 2'd2; // 記錄發出數量供 mem_cnt 更新
+    end else if (issue_ack_i[0]) begin 
+        rename_data_n[commit_pointer_q     ].valid          = 1'b0;
+        rename_data_n[commit_pointer_q     ].no_rename_rs1  = 1'b0;
+        commit_pointer_n                                    = commit_pointer_n + 3'd1;
+        commit_num                                          = 2'd1;
+    end
+
+    // ========================================================================
+    // ❷ 接收從 ID stage 傳入的兩條指令並寫入 rename FIFO（由 issue_pointer_q 指向）
+    // ========================================================================
+    if(((mem_cnt-issue_ack_i[0]-issue_ack_i[1])<3'd1) & (rename_instr_valid_i==2'b11)) begin 
+        issue_pointer_n                                   = issue_pointer_n + 2'd2;
+        issue_num                                         = 2'd2; // 記錄進入數量供 mem_cnt 更新
+        rename_ack_o [0]                                  = 1'b1;
+        rename_ack_o [1]                                  = 1'b1;
+        rename_data_n[issue_pointer_q     ].valid         = 1'b1;
+        rename_data_n[issue_pointer_q     ].data          = rename_entry      [0];
+        rename_data_n[issue_pointer_q     ].is_ctrl_flow  = is_ctrl_flow_i    [0];
+        rename_data_n[issue_pointer_q     ].no_rename_rs1 = rs1_no_rename     [0];
+        rename_data_n[issue_pointer_q+2'd1].valid         = 1'b1;
+        rename_data_n[issue_pointer_q+2'd1].data          = rename_entry      [1];
+        rename_data_n[issue_pointer_q+2'd1].is_ctrl_flow  = is_ctrl_flow_i    [1];
+        rename_data_n[issue_pointer_q+2'd1].no_rename_rs1 = rs1_no_rename     [1];
+    end else if (rename_instr_valid_i[0] & !mem_full) begin
+        issue_pointer_n                                   = issue_pointer_n + 2'd1;
+        issue_num                                         = 2'd1;
+        rename_ack_o [0]                                  = 1'b1;
+        rename_data_n[issue_pointer_q     ].valid         = 1'b1;
+        rename_data_n[issue_pointer_q     ].data          = rename_entry      [0];
+        rename_data_n[issue_pointer_q     ].is_ctrl_flow  = is_ctrl_flow_i    [0];
+        rename_data_n[issue_pointer_q     ].no_rename_rs1 = rs1_no_rename     [0];
+    end
+end
+```
+
+---
+
+### 📝 解釋重點
+| 行為情境                             | 說明 |
+|--------------------------------------|------|
+| `issue_ack_i` 表示 rename buffer 資料被 issue | 將對應資料從 rename FIFO "清空"（valid = 0）並更新 commit pointer |
+| `rename_instr_valid_i` 表示有來自 ID 的新指令 | 將兩條指令寫入 rename FIFO，並拉高對應的 `rename_ack_o` 告知 ID stage |
+| `mem_cnt` 保持 rename FIFO 的佔用狀態     | 實際更新動作在時脈區塊（`always_ff`），此處只記錄即將變化的數量 |
+
+---
+
