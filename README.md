@@ -26,7 +26,7 @@ typedef struct packed {
   logic [(riscv::XLEN/8)-1:0] lsu_wmask;
   riscv::xlen_t lsu_wdata;
   logic vfp;
-} scoreboard_entry_t;
+} scoreboard_entry_t;```
 ### 📝 scoreboard_entry_t 欄位對應說明
 
 | 欄位名稱         | 資料型態                                | 說明 |
