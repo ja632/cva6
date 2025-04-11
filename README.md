@@ -710,3 +710,85 @@ end
 ---
 
 ✅ `rename_entry[1]` 處理的重點在於避免與前一條 rename_entry[0] 發生 RAW hazard，同時針對浮點立即數進行轉換處理。
+
+---
+
+## 🧪 Rename Entry 生成與資料寫入
+
+這段邏輯主要負責將 ID 階段解碼後的 `scoreboard_entry_t` 進行目的暫存器映射、來源暫存器讀出對應實體暫存器值後，封裝成 `rename_entry` 發送給後續發射階段。
+
+（略過 rename_entry[0], rename_entry[1] 詳細設定）
+
+---
+
+## 🚫 No Rename Instruction 判斷邏輯
+
+```systemverilog
+assign rd_0_no_rename[0] = (is_rd_fpr(rename_instr_i[0].op)) ? 1'd0 : (rename_instr_i[0].rd == 6'd0);
+assign rd_0_no_rename[1] = (is_rd_fpr(rename_instr_i[1].op)) ? 1'd0 : (rename_instr_i[1].rd == 6'd0);
+
+assign no_rename[0] = (
+    (rename_instr_i[0].op == 8'h00 && rename_instr_i[0].fu == 4'b0100 && rename_instr_i[0].rd == 6'd0) ||
+    op_is_branch(rename_instr_i[0].op) ||
+    is_csr_no_rename(rename_instr_i[0].op) ||
+    (is_no_rename_rd_zero(rename_instr_i[0].op) && rename_instr_i[0].rd == 6'd0) ||
+    is_store(rename_instr_i[0].op) ||
+    rd_0_no_rename[0] || flush_unissied_instr_i || flush_i
+);
+
+assign no_rename[1] = (
+    (rename_instr_i[1].op == 8'h00 && rename_instr_i[1].fu == 4'b0100 && rename_instr_i[1].rd == 6'd0) ||
+    op_is_branch(rename_instr_i[1].op) ||
+    is_csr_no_rename(rename_instr_i[1].op) ||
+    (is_no_rename_rd_zero(rename_instr_i[1].op) && rename_instr_i[1].rd == 6'd0) ||
+    is_store(rename_instr_i[1].op) ||
+    rd_0_no_rename[1] || flush_unissied_instr_i || flush_i
+);
+```
+
+📌 說明：
+- 判斷該指令是否需要 register rename。
+- 若屬於 branch、CSR、store、或目的暫存器為 x0，則不需 rename。
+- `flush_unissied_instr_i` 或 `flush_i` 為清除 pipeline 的訊號，也會導致不 rename。
+
+---
+
+## 🔁 Branch Tag Snapshot
+
+該邏輯用於追蹤正在 rename 階段中發出的 branch instruction，以便之後發生錯誤預測（mispredict）時能夠正確回溯。
+
+```systemverilog
+assign br_instr[0] = (rename_instr_i[0].fu == 4'd4);
+assign br_instr[1] = (rename_instr_i[1].fu == 4'd4);
+
+assign issue1_is_branch = (rename_instr_i[0].fu == 4'd4 && rename_instr_valid_i[0] && rename_ack_o[0] && !flush_unissied_instr_i);
+assign issue2_is_branch = (rename_instr_i[1].fu == 4'd4 && rename_instr_valid_i[1] && rename_ack_o[1] && !flush_unissied_instr_i);
+
+always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (~rst_ni) begin
+        br_push_ptr <= 4'd0;
+    end else if (issue1_is_branch && issue2_is_branch) begin
+        br_push_ptr <= br_push_ptr + 4'd2;
+    end else if (issue1_is_branch || issue2_is_branch) begin
+        br_push_ptr <= br_push_ptr + 4'd1;
+    end
+end
+
+always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (~rst_ni) begin
+        br_pop_ptr <= 4'd0;
+    end else if (flush_unissied_instr_i) begin
+        br_pop_ptr <= br_push_ptr;
+    end else if (resolve_branch_i) begin
+        br_pop_ptr <= br_pop_ptr + 4'd1;
+    end
+end
+```
+
+📌 說明：
+- `br_push_ptr`：遇到 branch 指令就記錄，目前 rename 階段中有多少 branch 指令。
+- `br_pop_ptr`：分支 resolve 或 mispredict 發生時依據該指標回溯狀態。
+- 實作上可配合 `maptable`, `freelist`, `busytable` 等模組來進行 rollback。
+
+---
+
