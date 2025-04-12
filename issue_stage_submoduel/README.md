@@ -179,6 +179,7 @@ assign flush_branch_mispredict_plus = (trans_id_i[6]==4'd15) ? 3'd0 : (trans_id_
 ariane_pkg::scoreboard_entry_t [1:0] decoded_instr;  // 暫存 port 0 與 port 1 的指令
 
 ```
+### 🔄 ROB Flush 邏輯與 RVFI 整合詳細解析
 
 ```systemverilog
 // ------------------------------------------------------------------------------------------------
