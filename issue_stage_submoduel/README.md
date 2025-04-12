@@ -837,7 +837,7 @@ end
 
 ### issue_read_operands module
 
----
+```systemverilog
 
 // ======================================================================================================
 // 🔍 Module Overview: issue_read_operands
