@@ -672,3 +672,125 @@ module maptable import ariane_pkg::*; #(
 | 快照功能     | 支援分支快照與 rollback，用於恢復 rename 狀態                           |
 | reverse lookup | 提供給外部模組從實體推回原虛擬暫存器，方便 debug/commit 邏輯             |
 
+---
+
+### 🧩 Maptable - 暫存器映射狀態與控制邏輯
+
+```systemverilog
+localparam int unsigned BITS_MAPTABLE = $clog2(CVA6Cfg.Nrmaptable);
+
+// 定義一個映射表的結構：包含是否為浮點、是否是forward、以及對應的虛擬地址
+typedef struct packed {
+    logic is_float;                        // 是否為浮點暫存器
+    logic is_forward;                     // 是否為forward（即等待寫回）
+    logic [4:0] virtual_addr;             // 對應虛擬寄存器編號
+} maptable_mem_t;
+
+// 主映射表：maptable 的暫存與即時版本
+maptable_mem_t map_table_n   [CVA6Cfg.Nrmaptable-1:0];
+maptable_mem_t map_table_q   [CVA6Cfg.Nrmaptable-1:0];
+maptable_mem_t br_snopshot   [15:0][31:0];   // 用於 branch 快照復原
+
+// 各種內部暫存邏輯訊號
+logic [CVA6Cfg.NrissuePorts-1:0][BITS_MAPTABLE-1:0]      Pr_rs1;
+logic [CVA6Cfg.NrissuePorts-1:0][BITS_MAPTABLE-1:0]      Pr_rs2;
+logic [CVA6Cfg.NrissuePorts-1:0][BITS_MAPTABLE-1:0]      Pr_rs3;
+logic [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-2:0]      issue_rs1;
+logic [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-2:0]      issue_rs2;
+logic [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-2:0]      issue_rs3;
+logic [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-2:0]      issue_rd;
+logic [CVA6Cfg.NrissuePorts-1:0][BITS_MAPTABLE-1:0]      issue_ptr; 
+logic [CVA6Cfg.NrissuePorts-1:0][BITS_MAPTABLE-1:0]      commit_ptr; 
+logic [CVA6Cfg.NrissuePorts-1:0]                         mux_rs1;
+logic [CVA6Cfg.NrissuePorts-1:0]                         mux_rs2;
+logic [CVA6Cfg.NrissuePorts-1:0]                         mux_rs3;
+logic [CVA6Cfg.NrissuePorts-1:0]                         commit_enable;
+logic [CVA6Cfg.NrissuePorts-1:0]                         issue_enable;
+logic [CVA6Cfg.NrissuePorts-1:0]                         issue_is_branch;
+
+// 輸入解碼（來源寄存器與目的暫存器）
+assign issue_rs1[0] = issue_instr_i[0].rs1;
+assign issue_rs2[0] = issue_instr_i[0].rs2;
+assign issue_rs3[0] = issue_instr_i[0].result[4:0];
+assign issue_rd [0] = issue_instr_i[0].rd;
+assign issue_rs1[1] = issue_instr_i[1].rs1;
+assign issue_rs2[1] = issue_instr_i[1].rs2;
+assign issue_rs3[1] = issue_instr_i[1].result[4:0];
+assign issue_rd [1] = issue_instr_i[1].rd;
+
+// ------------------------------------------------------------------------------------------------
+// 發派與回寫控制訊號、freelist 對應 index
+// ------------------------------------------------------------------------------------------------
+assign issue_enable[0]  = issue_instr_valid_i[0] & issue_ack_o[0] & !no_rename_i[0];
+assign issue_enable[1]  = issue_instr_valid_i[1] & issue_ack_o[1] & !no_rename_i[1];
+assign issue_ptr[0]     = Pr_rd_o_rob[0];
+assign issue_ptr[1]     = Pr_rd_o_rob[1];
+assign commit_enable[0] = commit_instr_o[0].valid & commit_ack_i[0] & (commit_instr_o[0].rd != 6'd0);
+assign commit_enable[1] = commit_instr_o[1].valid & commit_ack_i[1] & (commit_instr_o[1].rd != 6'd0);
+assign commit_ptr[0]    = commit_instr_o[0].rd[4:0];
+assign commit_ptr[1]    = commit_instr_o[1].rd[4:0];
+
+// ------------------------------------------------------------------------------------------------
+// 計算發派時的來源暫存器 index（Pr_rs*_o），考慮 forwarding 狀況
+// ------------------------------------------------------------------------------------------------
+assign Pr_rs1_o[0] = (mux_rs1[0]) ? Pr_rs1[0] : 5'd0;
+assign Pr_rs2_o[0] = (mux_rs2[0]) ? Pr_rs2[0] : 5'd0;
+assign Pr_rs3_o[0] = (mux_rs3[0]) ? Pr_rs3[0] : 5'd0;
+
+// rs1 forwarding 判斷（第二條指令的 rs1 是否與第一條發派的 rd 相同）
+always_comb begin 
+    if ((issue_rs1[1] == issue_rd[0]) && !no_rename_i[0] &&
+        (is_rs1_fpr(issue_instr_i[1].op)) && (is_rd_fpr(issue_instr_i[0].op))) begin 
+        Pr_rs1_o[1] = issue_ptr[0];
+    end else if ((issue_rs1[1] == issue_rd[0]) && (issue_rd[0] != 6'd0) &&
+                 !no_rename_i[0] && !is_rs1_fpr(issue_instr_i[1].op) && !is_rd_fpr(issue_instr_i[0].op)) begin
+        Pr_rs1_o[1] = issue_ptr[0];
+    end else if (mux_rs1[1]) begin
+        Pr_rs1_o[1] = Pr_rs1[1];
+    end else begin
+        Pr_rs1_o[1] = 5'd0;
+    end
+end
+
+// rs2 forwarding 判斷
+always_comb begin 
+    if ((issue_rs2[1] == issue_rd[0]) && !no_rename_i[0] &&
+        (is_rs2_fpr(issue_instr_i[1].op) == is_rd_fpr(issue_instr_i[0].op))) begin 
+        Pr_rs2_o[1] = issue_ptr[0];
+    end else if ((issue_rs2[1] == issue_rd[0]) && (issue_rd[0] != 6'd0) &&
+                 !no_rename_i[0] && !is_rs2_fpr(issue_instr_i[1].op) && !is_rd_fpr(issue_instr_i[0].op)) begin
+        Pr_rs2_o[1] = issue_ptr[0];
+    end else if (mux_rs2[1]) begin
+        Pr_rs2_o[1] = Pr_rs2[1];
+    end else begin
+        Pr_rs2_o[1] = 5'd0;
+    end
+end
+
+// rs3 forwarding 判斷
+always_comb begin 
+    if ((issue_rs3[1] == issue_rd[0]) && !no_rename_i[0] &&
+        (is_imm_fpr(issue_instr_i[1].op) == is_rd_fpr(issue_instr_i[0].op))) begin 
+        Pr_rs3_o[1] = issue_ptr[0];
+    end else if ((issue_rs3[1] == issue_rd[0]) && (issue_rd[0] != 6'd0) &&
+                 !no_rename_i[0] && !is_imm_fpr(issue_instr_i[1].op) && !is_rd_fpr(issue_instr_i[0].op)) begin
+        Pr_rs3_o[1] = issue_ptr[0];
+    end else if (mux_rs3[1]) begin
+        Pr_rs3_o[1] = Pr_rs3[1];
+    end else begin
+        Pr_rs3_o[1] = 5'd0;
+    end
+end
+```
+
+---
+
+### 📘 小結：Forwarding 對映邏輯
+
+| 功能 | 說明 |
+|------|------|
+| `issue_ptr` | 來自 freelist，為每條指令分配的物理 rd index |
+| `Pr_rs*_o` | 每個來源暫存器對應的實體暫存器 index（含 forward 判斷） |
+| forwarding 條件 | 若 rs* 碰上另一條同 cycle 發派的 rd，且型別（FPR/GPR）相符，就 forward |
+| mux_* 控制 | 若來源是映射過的，就從 mapping table 取出對應實體暫存器 |
+
