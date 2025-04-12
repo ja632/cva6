@@ -489,3 +489,115 @@ end
 | all  | default 使用 ori rs | 若無依賴且 busy=0，表示資料 ready，直接使用原始 rs，有效位=1 |
 
 
+---
+
+### 🧠 Busytable - 寄存器狀態儲存與快照更新
+
+```systemverilog
+// ------------------------------------------------------------------------------------------------
+// 更新 busytable 實體暫存器狀態（以時脈觸發）
+// ------------------------------------------------------------------------------------------------
+always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (~rst_ni) begin
+        // 初始化：所有實體暫存器皆設為 not busy（0）
+        for (int unsigned j = 0; j < CVA6Cfg.Nrmaptable; j++) begin
+            physical_register_busytable_q[j] <= 1'd0;
+        end
+    end else if (flush_i) begin
+        // Flush 狀況下（如 mispredict），清空 busytable 狀態
+        for (int unsigned j = 0; j < CVA6Cfg.Nrmaptable; j++) begin
+            physical_register_busytable_q[j] <= 1'd0;
+        end
+    end else begin
+        // 正常情況更新 busytable 狀態
+        physical_register_busytable_q <= physical_register_busytable_n;
+    end 
+end
+
+// ------------------------------------------------------------------------------------------------
+// is branch or jalr (snapshot)：偵測是否需保存 busytable 狀態做為分支快照
+// ------------------------------------------------------------------------------------------------
+assign issue_is_branch[0] = (br_instr_i[0] & issue_instr_valid_i[0] & issue_ack_o[0]);
+assign issue_is_branch[1] = (br_instr_i[1] & issue_instr_valid_i[1] & issue_ack_o[1]);
+
+// ------------------------------------------------------------------------------------------------
+// busytable 快照保存邏輯：保存分支點時的暫存器狀態，供日後 flush 還原使用
+// ------------------------------------------------------------------------------------------------
+always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (~rst_ni) begin
+        // Reset 時初始化所有快照為 0
+        for (int unsigned j = 0; j < CVA6Cfg.Nrmaptable; j++) begin
+            for (int unsigned k = 0; k < 16; k++) begin
+                br_snopshot_busytable[k][j] <= 1'd0;
+            end        
+        end
+    end else begin
+        // 情況 1：同時發派兩條 branch 指令（紀錄兩組快照）
+        if(issue_is_branch[0] & issue_is_branch[1]) begin
+            for (int unsigned j = 0; j < CVA6Cfg.Nrmaptable; j++) begin
+                // 快照 1（br_push_ptr）紀錄當下 busytable 狀態
+                if(issue_enable[0] & (j==issue_ptr[0])) 
+                    br_snopshot_busytable[br_push_ptr][j] <= 1'd1;
+                else if(commit_enable[0] & (j==commit_ptr[0])) 
+                    br_snopshot_busytable[br_push_ptr][j] <= 1'd0;
+                else if(commit_enable[1] & (j==commit_ptr[1])) 
+                    br_snopshot_busytable[br_push_ptr][j] <= 1'd0;
+                else 
+                    br_snopshot_busytable[br_push_ptr][j] <= physical_register_busytable_q[j];
+            end
+            for (int unsigned j = 0; j < CVA6Cfg.Nrmaptable; j++) begin
+                // 快照 2（br_push_ptr+1）供第二條 branch 指令使用
+                if(issue_enable[0] & (j==issue_ptr[0])) 
+                    br_snopshot_busytable[br_push_ptr+4'd1][j] <= 1'd1;
+                else if(issue_enable[1] & (j==issue_ptr[1])) 
+                    br_snopshot_busytable[br_push_ptr+4'd1][j] <= 1'd1;
+                else if(commit_enable[0] & (j==commit_ptr[0])) 
+                    br_snopshot_busytable[br_push_ptr+4'd1][j] <= 1'd0;
+                else if(commit_enable[1] & (j==commit_ptr[1])) 
+                    br_snopshot_busytable[br_push_ptr+4'd1][j] <= 1'd0;
+                else 
+                    br_snopshot_busytable[br_push_ptr+4'd1][j] <= physical_register_busytable_q[j];
+            end
+        end 
+        // 情況 2：僅 issue[0] 為分支指令
+        else if(issue_is_branch[0]) begin 
+            for (int unsigned j = 0; j < CVA6Cfg.Nrmaptable; j++) begin
+                if(issue_enable[0] & (j==issue_ptr[0])) 
+                    br_snopshot_busytable[br_push_ptr][j] <= 1'd1;
+                else if(commit_enable[0] & (j==commit_ptr[0])) 
+                    br_snopshot_busytable[br_push_ptr][j] <= 1'd0;
+                else if(commit_enable[1] & (j==commit_ptr[1])) 
+                    br_snopshot_busytable[br_push_ptr][j] <= 1'd0;
+                else 
+                    br_snopshot_busytable[br_push_ptr][j] <= physical_register_busytable_q[j];
+            end
+        end 
+        // 情況 3：非分支指令，也需要保持最新狀態供錯誤修正還原使用
+        else begin 
+            for (int unsigned j = 0; j < CVA6Cfg.Nrmaptable; j++) begin
+                if(issue_enable[0] & (j==issue_ptr[0])) 
+                    br_snopshot_busytable[br_push_ptr][j] <= 1'd1;
+                else if(issue_enable[1] & (j==issue_ptr[1])) 
+                    br_snopshot_busytable[br_push_ptr][j] <= 1'd1;
+                else if(commit_enable[0] & (j==commit_ptr[0])) 
+                    br_snopshot_busytable[br_push_ptr][j] <= 1'd0;
+                else if(commit_enable[1] & (j==commit_ptr[1])) 
+                    br_snopshot_busytable[br_push_ptr][j] <= 1'd0;
+                else 
+                    br_snopshot_busytable[br_push_ptr][j] <= physical_register_busytable_q[j];
+            end
+        end
+    end
+end
+```
+
+---
+
+### 📘 小結：Busytable 的快照與還原
+
+| 操作類型         | 動作                                                               |
+|------------------|--------------------------------------------------------------------|
+| 發派兩條分支指令 | 建立兩個 snapshot，對應 `br_push_ptr` 和 `br_push_ptr+1`              |
+| 發派一條分支指令 | 建立一個 snapshot，對應 `br_push_ptr`                                |
+| 非分支發派       | 預先記錄 snapshot，供 mispredict 後還原使用                         |
+| Reset/Flush      | 快照資料歸零、busytable 狀態清除                                    |
