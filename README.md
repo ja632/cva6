@@ -928,5 +928,65 @@ module issue_stage
 - **判斷** 各功能單元是否就緒與能否接受該指令。
 - **管理** flush、分支錯誤、custom extension 發送、轉發資訊等。
 
-後續若要追蹤功能實作，可進一步往內看 Issue Queue、Scoreboard、Functional Dispatch 的邏輯。
+---
+
+### 🔗 ROB <-> Issue and Read Operands (IRO) 介面說明
+
+```systemverilog
+// ----------------------------------------------------------------------------------------------
+// rob (SB) <-> Issue and Read Operands (IRO)
+// ----------------------------------------------------------------------------------------------
+
+// 定義 rs3 的實際資料型別：若支援 3 組 GPR 寫回則為 XLEN，否則為 FLen
+typedef logic [(CVA6Cfg.NrRgprPorts == 3 ? riscv::XLEN : CVA6Cfg.FLen)-1:0] rs3_len_t;
+
+// 寄存器位址連線（來自 scoreboard/rob）
+logic [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-1:0]  rs1_iro_sb;  // 實體暫存器 rs1 的位址（IRO -> SB）
+logic [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-1:0]  rs2_iro_sb;  // 實體暫存器 rs2 的位址（IRO -> SB）
+logic [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-1:0]  rs3_iro_sb;  // 實體暫存器 rs3 的位址（IRO -> SB）
+
+// 從 SB 發過來要進入 IRO 的指令與 valid 資訊
+scoreboard_entry_t       [CVA6Cfg.NrissuePorts-1:0]  issue_instr_sb_iro;     // 待發派指令資訊
+logic                    [CVA6Cfg.NrissuePorts-1:0]  issue_instr_valid_sb_iro; // 待發派指令 valid bit
+logic                    [CVA6Cfg.NrissuePorts-1:0]  issue_ack_iro_sb;        // IRO 是否接受（握手成功）
+
+// 寄存器實際資料值（來自 SB）
+riscv::xlen_t            [CVA6Cfg.NrissuePorts-1:0]  rs1_sb_iro;  // rs1 實際資料值
+riscv::xlen_t            [CVA6Cfg.NrissuePorts-1:0]  rs2_sb_iro;  // rs2 實際資料值
+rs3_len_t                [CVA6Cfg.NrissuePorts-1:0]  rs3_sb_iro;  // rs3 實際資料值（型別依 GPR/FLen 而定）
+
+// 寄存器資料有效性（是否可供發派）
+logic                    [CVA6Cfg.NrissuePorts-1:0]  rs1_valid_sb_iro;  // rs1 資料是否有效
+logic                    [CVA6Cfg.NrissuePorts-1:0]  rs2_valid_iro_sb;  // rs2 資料是否有效
+logic                    [CVA6Cfg.NrissuePorts-1:0]  rs3_valid_iro_sb;  // rs3 資料是否有效
+
+// 用於追蹤實體暫存器是否被某個 FU 使用中（clobber = 尚未寫回）
+fu_t [2**REG_ADDR_SIZE-1:0] rd_clobber_gpr_sb_iro;  // 每個 GPR 是否被某 FU 寫入中
+fu_t [2**REG_ADDR_SIZE-1:0] rd_clobber_fpr_sb_iro;  // 每個 FPR 是否被某 FU 寫入中
+
+// forwarding 資料（VLEN bit 寬）給下游 FU 使用
+riscv::xlen_t rs1_forwarding_xlen;
+riscv::xlen_t rs2_forwarding_xlen;
+
+assign rs1_forwarding_o = rs1_forwarding_xlen[riscv::VLEN-1:0]; // 將 rs1 的 forwarding 結果輸出
+assign rs2_forwarding_o = rs2_forwarding_xlen[riscv::VLEN-1:0]; // 將 rs2 的 forwarding 結果輸出
+
+// 將發派的指令資訊與握手訊號輸出到下游 FU 或 Dispatcher
+assign issue_instr_o    = issue_instr_sb_iro;
+assign issue_instr_hs_o = issue_instr_valid_sb_iro & issue_ack_iro_sb;  // 握手條件：valid 且 ack
+```
+
+---
+
+### 📘 小結：ROB <-> IRO 資料路徑與控制訊號
+
+| 類別        | 資料方向       | 功能說明                                               |
+|-------------|----------------|----------------------------------------------------------|
+| rs*_iro_sb  | IRO → SB       | 傳送實體暫存器位址給 scoreboard 判斷是否 ready        |
+| rs*_sb_iro  | SB → IRO       | 實際寄存器數值資料                                     |
+| issue_*     | SB → IRO       | 指令資訊與發派握手                                      |
+| rs*_valid   | SB → IRO       | 判斷對應 operand 是否可用                              |
+| rd_clobber* | SB → IRO       | 標記尚未寫回的實體暫存器所屬 FU                        |
+| *_forwarding_o | IRO → FU     | operand forwarding 給下游 Functional Unit 使用        |
+
 
