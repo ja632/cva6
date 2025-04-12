@@ -926,3 +926,142 @@ end
 | overwrite 清除 | 若有新對應，需將先前相同虛擬 register 的 mapping 設為無效，避免混淆           |
 | rollback     | 若發生 flush，可根據 snapshot `br_snopshot` 還原到當下 mapping 狀態        |
 | commit       | 當指令寫回（commit）時，對應實體暫存器應從 mapping table 中移除             |
+
+---
+
+### 🔍 Maptable - Read Source Register Logic
+
+這部分負責從 `map_table_q` 中讀取對應的 source register（rs1、rs2、rs3）對應的 physical register 編號，並判斷是否有效。
+
+```systemverilog
+// ------------------------------------------------------------------------------------------------
+//  由 logical register (rs1, rs2, rs3) 反查對應的 physical register（map table 對應條目）
+// ------------------------------------------------------------------------------------------------
+
+// -------- rs1 port 0 --------
+always_comb begin
+    Pr_rs1 [0] = 5'd0;
+    mux_rs1[0] = 1'd0;
+    for (int unsigned j = 0; j < CVA6Cfg.Nrmaptable; j++) begin
+        if(is_rs1_fpr(issue_instr_i[0].op)) begin 
+            // 查找浮點 rs1 mapping
+            if((map_table_q[j].virtual_addr == issue_rs1[0]) && map_table_q[j].is_forward && map_table_q[j].is_float) begin 
+                Pr_rs1 [0] = j;
+                mux_rs1[0] = 1'd1;
+            end
+        end else begin 
+            // 查找整數 rs1 mapping
+            if((map_table_q[j].virtual_addr == issue_rs1[0]) && map_table_q[j].is_forward && !map_table_q[j].is_float) begin 
+                Pr_rs1 [0] = j;
+                mux_rs1[0] = 1'd1;
+            end 
+        end
+    end
+end
+
+// -------- rs1 port 1 --------
+always_comb begin
+    Pr_rs1 [1] = 5'd0;
+    mux_rs1[1] = 1'd0;
+    for (int unsigned j = 0; j < CVA6Cfg.Nrmaptable; j++) begin
+        if(is_rs1_fpr(issue_instr_i[1].op)) begin
+            if((map_table_q[j].virtual_addr == issue_rs1[1]) && map_table_q[j].is_forward && map_table_q[j].is_float) begin 
+                Pr_rs1 [1] = j;
+                mux_rs1[1] = 1'd1;
+            end
+        end else begin 
+            if((map_table_q[j].virtual_addr == issue_rs1[1]) && map_table_q[j].is_forward && !map_table_q[j].is_float) begin 
+                Pr_rs1 [1] = j;
+                mux_rs1[1] = 1'd1;
+            end
+        end
+    end
+end
+
+// -------- rs2 port 0 --------
+always_comb begin
+    Pr_rs2 [0] = 5'd0;
+    mux_rs2[0] = 1'd0;
+    for (int unsigned j = 0; j < CVA6Cfg.Nrmaptable; j++) begin
+        if(is_rs2_fpr(issue_instr_i[0].op)) begin 
+            if((map_table_q[j].virtual_addr == issue_rs2[0]) && map_table_q[j].is_forward && map_table_q[j].is_float) begin 
+                Pr_rs2 [0] = j;
+                mux_rs2[0] = 1'd1;
+            end
+        end else begin 
+            if((map_table_q[j].virtual_addr == issue_rs2[0]) && map_table_q[j].is_forward && !map_table_q[j].is_float) begin 
+                Pr_rs2 [0] = j;
+                mux_rs2[0] = 1'd1;
+            end
+        end
+    end
+end
+
+// -------- rs2 port 1 --------
+always_comb begin
+    Pr_rs2 [1] = 5'd0;
+    mux_rs2[1] = 1'd0;
+    for (int unsigned j = 0; j < CVA6Cfg.Nrmaptable; j++) begin
+        if(is_rs2_fpr(issue_instr_i[1].op)) begin 
+            if((map_table_q[j].virtual_addr == issue_rs2[1]) && map_table_q[j].is_forward && map_table_q[j].is_float) begin 
+                Pr_rs2 [1] = j;
+                mux_rs2[1] = 1'd1;
+            end
+        end else begin 
+            if((map_table_q[j].virtual_addr == issue_rs2[1]) && map_table_q[j].is_forward && !map_table_q[j].is_float) begin 
+                Pr_rs2 [1] = j;
+                mux_rs2[1] = 1'd1;
+            end
+        end
+    end
+end
+
+// -------- rs3 port 0 --------
+always_comb begin
+    Pr_rs3 [0] = 5'd0;
+    mux_rs3[0] = 1'd0;
+    for (int unsigned j = 0; j < CVA6Cfg.Nrmaptable; j++) begin
+        if(is_imm_fpr(issue_instr_i[0].op)) begin 
+            if((map_table_q[j].virtual_addr == issue_rs3[0]) && map_table_q[j].is_forward && map_table_q[j].is_float) begin 
+                Pr_rs3 [0] = j;
+                mux_rs3[0] = 1'd1;
+            end
+        end else begin 
+            if((map_table_q[j].virtual_addr == issue_rs3[0]) && map_table_q[j].is_forward && !map_table_q[j].is_float) begin 
+                Pr_rs3 [0] = j;
+                mux_rs3[0] = 1'd1;
+            end
+        end
+    end
+end
+
+// -------- rs3 port 1 --------
+always_comb begin
+    Pr_rs3 [1] = 5'd0;
+    mux_rs3[1] = 1'd0;
+    for (int unsigned j = 0; j < CVA6Cfg.Nrmaptable; j++) begin
+        if(is_imm_fpr(issue_instr_i[1].op)) begin 
+            if((map_table_q[j].virtual_addr == issue_rs3[1]) && map_table_q[j].is_forward && map_table_q[j].is_float) begin 
+                Pr_rs3 [1] = j;
+                mux_rs3[1] = 1'd1;
+            end
+        end else begin 
+            if((map_table_q[j].virtual_addr == issue_rs3[1]) && map_table_q[j].is_forward && !map_table_q[j].is_float) begin 
+                Pr_rs3 [1] = j;
+                mux_rs3[1] = 1'd1;
+            end
+        end
+    end
+end
+```
+
+---
+
+### 📘 小結
+
+| 欄位       | 說明                                                                 |
+|------------|----------------------------------------------------------------------|
+| `Pr_rsX`   | 為當前 virtual source register 在 map table 中對應的 physical index |
+| `mux_rsX`  | 為是否成功從 map table 中查找到對應條目（避免誤用 x0）               |
+| 條件邏輯   | 需同時比對 `virtual_addr`、`is_forward` 和是否整數/浮點一致性判斷       |
+
