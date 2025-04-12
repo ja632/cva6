@@ -797,6 +797,7 @@ end
 - `maptable`：追蹤 architectural ↔ physical 對應
 - `freelist`：回收已經不用的 physical register 並分配給新指令
 
+---
 
 ### 🚦 Issue Stage Module 介面說明與註解
 
