@@ -372,3 +372,120 @@ end
 | flush_unissued | 發生 branch mispredict 時，透過快照還原 busytable |
 | 強制清除 | x0 寄存器永遠設為 0，避免誤標 busy                    |
 
+
+### 🔁 Busytable - Forwarding 機制與來源暫存器決策邏輯
+
+```systemverilog
+// ------------------------------------------------------------------------------------------------
+// Forwarding 判斷規則
+// ------------------------------------------------------------------------------------------------
+// 規則：
+// 1. 若對應的實體暫存器仍為 busy（尚未寫回），代表仍需等待，valid_bit = 0
+// 2. 若指令間發生 dual-issue 資源依賴（Ex: rs1 指向上一條發出的 rd），也視為 busy
+// 3. 否則表示資料已可用，valid_bit = 1，直接使用原始 rs1/rs2 編號
+// ------------------------------------------------------------------------------------------------
+
+// 擷取 issue 指令原始的 rs1/rs2/rs3 編號（不含 valid bit）
+logic [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-2:0] issue_rs1;
+logic [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-2:0] issue_rs2;
+logic [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-2:0] issue_rs3;
+
+assign issue_rs1[0] = issue_instr_i[0].rs1[4:0];
+assign issue_rs2[0] = issue_instr_i[0].rs2[4:0];
+assign issue_rs3[0] = issue_instr_i[0].result[4:0];
+
+assign issue_rs1[1] = issue_instr_i[1].rs1[4:0];
+assign issue_rs2[1] = issue_instr_i[1].rs2[4:0];
+assign issue_rs3[1] = issue_instr_i[1].result[4:0];
+
+// ----------------------
+// 處理 port 0 的 rs1
+// ----------------------
+// 若 Pr_rs1_o[0] 在 busytable 中仍為 busy，則 rs1 尚未 ready，valid bit = 0
+// 否則表示可用，使用原始 rs1 並設 valid bit = 1
+always_comb begin 
+    if(physical_register_busytable_q[Pr_rs1_o[0]]) begin 
+        Pr_rs1_o_rob[0] = {1'd0, Pr_rs1_o[0]};
+    end else begin 
+        Pr_rs1_o_rob[0] = {1'd1, issue_rs1[0]};
+    end
+end
+
+// ----------------------
+// 處理 port 1 的 rs1
+// ----------------------
+// 若 Pr_rs1_o[1] == issue_ptr[0]，代表與前一條指令（port 0）發派的 destination 相同
+// 則需視是否為 floating-point register 判斷是否 hazard 發生
+// 否則，再查 busytable 判斷是否 ready
+always_comb begin 
+    if((Pr_rs1_o[1] == issue_ptr[0]) & (is_rs1_fpr(issue_instr_i[1].op)) & (is_rd_fpr(issue_instr_i[0].op))) begin 
+        Pr_rs1_o_rob[1] = {1'd0, Pr_rs1_o[1]};
+    end else if((Pr_rs1_o[1] == issue_ptr[0]) & (Pr_rs1_o[1]!='d0) & !(is_rs1_fpr(issue_instr_i[1].op)) & !(is_rd_fpr(issue_instr_i[0].op))) begin 
+        Pr_rs1_o_rob[1] = {1'd0, Pr_rs1_o[1]};
+    end else if(physical_register_busytable_q[Pr_rs1_o[1]]) begin 
+        Pr_rs1_o_rob[1] = {1'd0, Pr_rs1_o[1]};
+    end else begin 
+        Pr_rs1_o_rob[1] = {1'd1, issue_rs1[1]};
+    end
+end
+
+// ----------------------
+// rs2 同理處理邏輯
+// ----------------------
+
+always_comb begin 
+    if(physical_register_busytable_q[Pr_rs2_o[0]]) begin 
+        Pr_rs2_o_rob[0] = {1'd0, Pr_rs2_o[0]};
+    end else begin 
+        Pr_rs2_o_rob[0] = {1'd1, issue_rs2[0]};
+    end
+end
+
+always_comb begin 
+    if((Pr_rs2_o[1] == issue_ptr[0]) & (is_rs2_fpr(issue_instr_i[1].op)) & (is_rd_fpr(issue_instr_i[0].op))) begin 
+        Pr_rs2_o_rob[1] = {1'd0, Pr_rs2_o[1]};
+    end else if((Pr_rs2_o[1] == issue_ptr[0]) & (Pr_rs2_o[1]!='d0) & !(is_rs2_fpr(issue_instr_i[1].op)) & !(is_rd_fpr(issue_instr_i[0].op))) begin 
+        Pr_rs2_o_rob[1] = {1'd0, Pr_rs2_o[1]};
+    end else if(physical_register_busytable_q[Pr_rs2_o[1]]) begin 
+        Pr_rs2_o_rob[1] = {1'd0, Pr_rs2_o[1]};
+    end else begin 
+        Pr_rs2_o_rob[1] = {1'd1, issue_rs2[1]};
+    end
+end
+
+// ----------------------
+// rs3 處理（通常為浮點 imm 結果）
+// ----------------------
+
+always_comb begin     
+    if(physical_register_busytable_q[Pr_rs3_o[0]]) begin 
+        Pr_rs3_o_rob[0] = {1'd0, Pr_rs3_o[0]};
+    end else begin 
+        Pr_rs3_o_rob[0] = {1'd1, issue_rs3[0]};
+    end
+end
+
+always_comb begin 
+    if((Pr_rs3_o[1] == issue_ptr[0]) & (is_imm_fpr(issue_instr_i[1].op)) & (is_rd_fpr(issue_instr_i[0].op))) begin 
+        Pr_rs3_o_rob[1] = {1'd0, Pr_rs3_o[1]};
+    end else if((Pr_rs3_o[1] == issue_ptr[0]) & (Pr_rs3_o[1]!='d0) & !(is_imm_fpr(issue_instr_i[1].op)) & !(is_rd_fpr(issue_instr_i[0].op))) begin 
+        Pr_rs3_o_rob[1] = {1'd0, Pr_rs3_o[1]};
+    end else if(physical_register_busytable_q[Pr_rs3_o[1]]) begin 
+        Pr_rs3_o_rob[1] = {1'd0, Pr_rs3_o[1]};
+    end else begin 
+        Pr_rs3_o_rob[1] = {1'd1, issue_rs3[1]};
+    end
+end
+```
+
+---
+
+### 📘 小結：Forwarding 判斷邏輯
+
+| Port | 來源         | 條件說明                                                                 |
+|------|--------------|--------------------------------------------------------------------------|
+| 0    | busy table   | 若 busytable 顯示為 busy，則 valid=0                                     |
+| 1    | dual-issue hazard | 若 Port1 的 rs1/rs2/rs3 指向 Port0 的 rd，代表發生依賴，valid=0    |
+| all  | default 使用 ori rs | 若無依賴且 busy=0，表示資料 ready，直接使用原始 rs，有效位=1 |
+
+
