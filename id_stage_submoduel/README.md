@@ -794,3 +794,135 @@ end
 | forwarding 條件 | 若 rs* 碰上另一條同 cycle 發派的 rd，且型別（FPR/GPR）相符，就 forward |
 | mux_* 控制 | 若來源是映射過的，就從 mapping table 取出對應實體暫存器 |
 
+---
+
+### 🔁 Maptable - Virtual Address 回寫與 Mapping 更新邏輯
+
+```systemverilog
+// ------------------------------------------------------------------------------------------------
+//  physical register index to local register index
+// ------------------------------------------------------------------------------------------------
+
+// 判斷 commit 實體暫存器是否仍維持 forwarding 對應狀態（即尚未被 override）
+assign virtual_waddr_valid[0] = map_table_q[physical_waddr_i[0]].is_forward;
+assign virtual_waddr_valid[1] = map_table_q[physical_waddr_i[1]].is_forward;
+
+// 根據 forwarding 狀態回推出對應虛擬暫存器 index
+assign virtual_waddr_o[0] = {1'd0, map_table_q[physical_waddr_i[0]].virtual_addr};
+assign virtual_waddr_o[1] = {1'd0, map_table_q[physical_waddr_i[1]].virtual_addr};
+
+// 根據實體 index 查回目前所對應的虛擬暫存器，並加上 forwarding 有效 bit 作為 valid 位元
+assign rs1_virtual_o[0] = {map_table_q[rs1_physical_i[0]].is_forward, map_table_q[rs1_physical_i[0]].virtual_addr};
+assign rs2_virtual_o[0] = {map_table_q[rs2_physical_i[0]].is_forward, map_table_q[rs2_physical_i[0]].virtual_addr};
+assign rs3_virtual_o[0] = {map_table_q[rs3_physical_i[0]].is_forward, map_table_q[rs3_physical_i[0]].virtual_addr};
+
+assign rs1_virtual_o[1] = {map_table_q[rs1_physical_i[1]].is_forward, map_table_q[rs1_physical_i[1]].virtual_addr};
+assign rs2_virtual_o[1] = {map_table_q[rs2_physical_i[1]].is_forward, map_table_q[rs2_physical_i[1]].virtual_addr};
+assign rs3_virtual_o[1] = {map_table_q[rs3_physical_i[1]].is_forward, map_table_q[rs3_physical_i[1]].virtual_addr};
+```
+
+---
+
+### 🧠 Maptable 更新邏輯（Issue + Commit）
+
+```systemverilog
+// ------------------------------------------------------------------------------------------------
+//  store and commit  Pr_rd_o_rob in map table
+// ------------------------------------------------------------------------------------------------
+
+always_comb begin
+    map_table_n = map_table_q; // 預設保持不變
+
+    // 分支 mispredict 時恢復舊快照
+    if(flush_unissied_instr_i) begin
+        for (int unsigned j = 0; j < CVA6Cfg.Nrmaptable; j++) begin 
+            if(map_table_q[j] != '0) begin 
+                map_table_n[j] = br_snopshot[br_pop_ptr][j];
+            end
+        end
+    end
+
+    // 雙發派條件處理
+    if(issue_enable[0] & issue_enable[1]) begin
+        // 若兩條指令目的虛擬暫存器不同，分別建立 forwarding 對應關係
+        if((issue_rd[0] != issue_rd[1]) | (is_rd_fpr(issue_instr_i[0].op) != is_rd_fpr(issue_instr_i[1].op))) begin 
+            map_table_n[issue_ptr[0]].is_float     = is_rd_fpr(issue_instr_i[0].op);
+            map_table_n[issue_ptr[0]].is_forward   = 1'd1;
+            map_table_n[issue_ptr[0]].virtual_addr = issue_rd[0];
+            map_table_n[issue_ptr[1]].is_float     = is_rd_fpr(issue_instr_i[1].op);
+            map_table_n[issue_ptr[1]].is_forward   = 1'd1;
+            map_table_n[issue_ptr[1]].virtual_addr = issue_rd[1];
+
+            // 清除舊對應關係
+            for (int unsigned j = 0; j < CVA6Cfg.Nrmaptable; j++) begin
+                if(map_table_n[j].virtual_addr == issue_rd[0] && j != issue_ptr[0] && map_table_n[j].is_forward && map_table_n[j].is_float == is_rd_fpr(issue_instr_i[0].op))
+                    map_table_n[j].is_forward = 1'd0;
+                if(map_table_n[j].virtual_addr == issue_rd[1] && j != issue_ptr[1] && map_table_n[j].is_forward && map_table_n[j].is_float == is_rd_fpr(issue_instr_i[1].op))
+                    map_table_n[j].is_forward = 1'd0;
+            end
+        end else begin
+            // 若兩條指令寫入同一個目的虛擬暫存器，只記錄後一條 forwarding（避免錯誤對應）
+            map_table_n[issue_ptr[0]].is_float     = is_rd_fpr(issue_instr_i[0].op);
+            map_table_n[issue_ptr[0]].is_forward   = 1'd0;
+            map_table_n[issue_ptr[0]].virtual_addr = issue_rd[0];
+            map_table_n[issue_ptr[1]].is_float     = is_rd_fpr(issue_instr_i[1].op);
+            map_table_n[issue_ptr[1]].is_forward   = 1'd1;
+            map_table_n[issue_ptr[1]].virtual_addr = issue_rd[1];
+
+            for (int unsigned j = 0; j < CVA6Cfg.Nrmaptable; j++) begin
+                if(map_table_n[j].virtual_addr == issue_rd[1] && j != issue_ptr[1] && map_table_n[j].is_forward && map_table_n[j].is_float == is_rd_fpr(issue_instr_i[1].op))
+                    map_table_n[j].is_forward = 1'd0;
+            end
+        end
+    end
+    // 單發派條件（同樣建立 forwarding 並移除舊的）
+    else if(issue_enable[0]) begin
+        map_table_n[issue_ptr[0]].is_float     = is_rd_fpr(issue_instr_i[0].op);
+        map_table_n[issue_ptr[0]].is_forward   = 1'd1;
+        map_table_n[issue_ptr[0]].virtual_addr = issue_rd[0];
+
+        for (int unsigned j = 0; j < CVA6Cfg.Nrmaptable; j++) begin
+            if(map_table_n[j].virtual_addr == issue_rd[0] && j != issue_ptr[0] && map_table_n[j].is_forward && map_table_n[j].is_float == is_rd_fpr(issue_instr_i[0].op))
+                map_table_n[j].is_forward = 1'd0;
+        end
+    end 
+    else if(issue_enable[1]) begin
+        map_table_n[issue_ptr[1]].is_float     = is_rd_fpr(issue_instr_i[1].op);
+        map_table_n[issue_ptr[1]].is_forward   = 1'd1;
+        map_table_n[issue_ptr[1]].virtual_addr = issue_rd[1];
+
+        for (int unsigned j = 0; j < CVA6Cfg.Nrmaptable; j++) begin
+            if(map_table_n[j].virtual_addr == issue_rd[1] && j != issue_ptr[1] && map_table_n[j].is_forward && map_table_n[j].is_float == is_rd_fpr(issue_instr_i[1].op))
+                map_table_n[j].is_forward = 1'd0;
+        end
+    end
+
+    // commit 時移除 forwarding 關係（寄存器釋放）
+    if(commit_enable[0]) begin 
+        map_table_n[commit_ptr[0]].is_float     = 'd0;
+        map_table_n[commit_ptr[0]].is_forward   = 'd0;
+        map_table_n[commit_ptr[0]].virtual_addr = 'd0;
+    end
+    if(commit_enable[1]) begin 
+        map_table_n[commit_ptr[1]].is_float     = 'd0;
+        map_table_n[commit_ptr[1]].is_forward   = 'd0;
+        map_table_n[commit_ptr[1]].virtual_addr = 'd0;
+    end
+
+    // x0 register 保持無 forwarding
+    map_table_n[0].is_float     = '0;
+    map_table_n[0].is_forward   = '0;
+    map_table_n[0].virtual_addr = '0;
+end
+```
+
+---
+
+### 📘 小結：Maptable 功能說明
+
+| 機制         | 功能說明                                                                 |
+|--------------|--------------------------------------------------------------------------|
+| forwarding   | 建立虛擬 → 實體 register mapping，便於 issue 階段 operand 取得               |
+| overwrite 清除 | 若有新對應，需將先前相同虛擬 register 的 mapping 設為無效，避免混淆           |
+| rollback     | 若發生 flush，可根據 snapshot `br_snopshot` 還原到當下 mapping 狀態        |
+| commit       | 當指令寫回（commit）時，對應實體暫存器應從 mapping table 中移除             |
