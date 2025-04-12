@@ -216,4 +216,89 @@ always_ff @(posedge clk_i or negedge rst_ni) begin
     end
 end
 ```
+### 🔄 Busytable 子模組初始化與定義區塊
+
+```systemverilog
+module busytable import ariane_pkg::*;  #(
+    parameter config_pkg::cva6_cfg_t CVA6Cfg = config_pkg::cva6_cfg_empty
+) (
+    input  logic                                                                   clk_i,    // 時鐘訊號
+    input  logic                                                                   rst_ni,   // 非同步 reset（低電位有效）
+    input  logic                                                                   flush_i,  // 清空全部 busytable 狀態
+    input  logic                                                                   flush_unissied_instr_i, // 清空未發派指令的狀態
+
+    // 從 scoreboard 接收 issue 訊號（發派指令）
+    input  scoreboard_entry_t    [CVA6Cfg.NrissuePorts-1:0]                        issue_instr_i,         // 發派的 scoreboard 指令內容
+    input  logic                 [CVA6Cfg.NrissuePorts-1:0]                        issue_instr_valid_i,   // 發派指令是否有效
+    input  logic                 [CVA6Cfg.NrissuePorts-1:0]                        issue_ack_o,           // 發派是否成功（handshake）
+    input  logic                 [CVA6Cfg.NrissuePorts-1:0]                        no_rename_i,           // 指令是否不需要 rename
+
+    // 從 scoreboard 接收 commit 訊號（指令寫回）
+    input  scoreboard_entry_t    [CVA6Cfg.NrissuePorts-1:0]                        commit_instr_o,        // 寫回的 scoreboard 指令內容
+    input  logic                 [CVA6Cfg.NrissuePorts-1:0]                        commit_ack_i,          // 寫回是否成功
+    input  logic                 [CVA6Cfg.NrissuePorts-1:0]                        commit_no_rename,      // commit 的指令是否沒被 rename
+
+    // 實體暫存器對應的目的暫存器與來源暫存器編號（不帶 valid bit）
+    input                        [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-2:0]     Pr_rd_o_rob,           // rename 指定的 destination register（實體）
+    input                        [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-2:0]     Pr_rs1_o,              // rename 對應的 source register 1（實體）
+    input                        [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-2:0]     Pr_rs2_o,              // rename 對應的 source register 2（實體）
+    input                        [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-2:0]     Pr_rs3_o,              // rename 對應的 source register 3（實體）
+
+    // 加上 valid bit 的輸出來源暫存器（提供給後續使用單元）
+    output logic                 [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-1:0]     Pr_rs1_o_rob,          // rs1 + valid bit
+    output logic                 [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-1:0]     Pr_rs2_o_rob,          // rs2 + valid bit
+    output logic                 [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-1:0]     Pr_rs3_o_rob,          // rs3 + valid bit
+
+    // 分支處理相關資訊（br_tag 快照機制）
+    input logic                  [CVA6Cfg.NrissuePorts-1:0]                        br_instr_i,            // 是否為分支指令
+    input                        [3:0]                                             br_push_ptr,           // push snapshot 編號
+    input                        [3:0]                                             br_pop_ptr             // pop snapshot 編號
+);
+```
+
+---
+
+### 🧩 Busytable - 註冊區塊與中間變數說明
+
+```systemverilog
+localparam int unsigned BITS_MAPTABLE = $clog2(CVA6Cfg.Nrmaptable); // 實體暫存器 bit 數
+
+// busytable 狀態記錄：是否某個實體暫存器正在使用中
+logic  physical_register_busytable_n [CVA6Cfg.Nrmaptable-1:0]; // 下一個狀態
+logic  physical_register_busytable_q [CVA6Cfg.Nrmaptable-1:0]; // 當前狀態
+
+// 分支 mispredict 時的快照
+logic  br_snopshot_busytable [15:0][CVA6Cfg.Nrmaptable-1:0]; // 最多記錄 16 組快照
+
+// 實體暫存器編號
+logic [CVA6Cfg.NrissuePorts-1:0][BITS_MAPTABLE-1:0] issue_ptr;   // rename 階段分配的實體暫存器
+logic [CVA6Cfg.NrissuePorts-1:0][BITS_MAPTABLE-1:0] commit_ptr;  // commit 階段釋放的實體暫存器
+
+// 啟用訊號
+logic [CVA6Cfg.NrissuePorts-1:0] commit_enable; // 是否可釋放實體暫存器
+logic [CVA6Cfg.NrissuePorts-1:0] issue_enable;  // 是否可發派實體暫存器
+
+// 是否是分支指令
+logic [CVA6Cfg.NrissuePorts-1:0] issue_is_branch;
+
+// 標記是否來源暫存器尚未 ready
+logic busy_rs1; 
+logic busy_rs2; 
+
+// Busytable 是否已滿（判斷是否有可用暫存器）
+logic full;    
+```
+
+---
+
+### 📘 功能摘要
+
+| 區塊名稱         | 說明                                                                 |
+|------------------|----------------------------------------------------------------------|
+| `physical_register_busytable_q` | 記錄所有實體暫存器目前是否忙碌（已分配但尚未 commit）                     |
+| `br_snopshot_busytable`         | 在分支發派時，記錄 busytable 的狀態以支援 mispredict 還原                   |
+| `issue_ptr` / `commit_ptr`      | 分別代表此 cycle 發派與寫回的目的暫存器編號                                 |
+| `issue_enable` / `commit_enable`| 控制訊號判斷當前是否進行發派或釋放動作                                      |
+| `busy_rs1/rs2`                  | 用來標示來源暫存器是否尚未就緒（尚在計算中）                                 |
+| `full`                          | 當所有暫存器皆為 busy 時，表示 busytable 滿載，可能需 stall pipeline           |
 
