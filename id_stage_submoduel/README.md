@@ -1,4 +1,3 @@
-
 ## 📦 freelist 子模組功能說明
 
 `freelist` 是 `re_name` 模組中用來管理**實體暫存器分配與回收**的子模組。
@@ -52,4 +51,42 @@ logic [BITS_MAPTABLE-1:0] pointer_freelist; // 下一個要分配的 register �
 
 ---
 
-✅ 此模組與 `maptable` / `busytable` 共同構成 rename 階段中 register 分配與追蹤系統的一環。
+### 🔄 Rename Commit 控制與指標邏輯
+```systemverilog
+assign issue_enable[0] = issue_instr_valid_i[0] & issue_ack_o[0] & !no_rename_i[0];
+assign issue_enable[1] = issue_instr_valid_i[1] & issue_ack_o[1] & !no_rename_i[1];
+
+assign commit_enable[0] = commit_instr_o[0].valid & commit_ack_i[0] & (commit_instr_o[0].rd != 6'd0);
+assign commit_enable[1] = commit_instr_o[1].valid & commit_ack_i[1] & (commit_instr_o[1].rd != 6'd0);
+
+assign Pr_rd_o_rob[0] = issue_ptr[0]; // 實體 register 分配結果
+assign Pr_rd_o_rob[1] = issue_ptr[1];
+
+assign commit_ptr[0] = commit_instr_o[0].rd[4:0]; // 被回收的實體暫存器編號
+assign commit_ptr[1] = commit_instr_o[1].rd[4:0];
+```
+
+### 🔢 分配指標管理邏輯
+```systemverilog
+// 使用遞增方式取用 pointer_freelist 中的 register
+always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (~rst_ni) begin
+        pointer_freelist <= 'd2; // x0 和 x1 不可使用
+    end else if(issue_enable[0] & issue_enable[1]) begin
+        pointer_freelist <= (pointer_freelist > 28) ? 2 : pointer_freelist + 2;
+    end else if(issue_enable[0] | issue_enable[1]) begin
+        pointer_freelist <= (pointer_freelist > 28) ? 2 : pointer_freelist + 1;
+    end
+end
+
+// 決定 issue_ptr：即將分配出去的實體暫存器編號
+always_comb begin
+    if(issue_enable[0] & issue_enable[1]) begin
+        issue_ptr[0] = pointer_freelist;
+        issue_ptr[1] = pointer_freelist + 1;
+    end else begin
+        issue_ptr[0] = pointer_freelist;
+        issue_ptr[1] = pointer_freelist;
+    end
+end
+```
