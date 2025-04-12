@@ -441,4 +441,90 @@ end
 
 這些機制確保後續執行單元可以正確讀取對應的寄存器值與指令內容，也為 commit 與 flush 提供基礎依據。
 
+---
 
+### 🔁 ROB 寫回與 Commit 更新邏輯
+
+```systemverilog
+// ------------------------------------------------------------------------------------------------
+// ✅ FU 為 NONE 的指令視為立即有效
+// ------------------------------------------------------------------------------------------------
+// 如果某條指令的功能單元 (FU) 是 NONE，代表它不需要等待資源即可執行，
+// 此時直接將該指令標記為 valid。
+for (int unsigned i = 0; i < NR_ENTRIES; i++) begin
+  if (mem_q[i].sbe.fu == ariane_pkg::NONE && mem_q[i].issued)
+    mem_n[i].sbe.valid = 1'b1;
+end
+
+// ------------------------------------------------------------------------------------------------
+// 🧾 Write Back（含 RVFI Trace 記錄）
+// ------------------------------------------------------------------------------------------------
+// 如果啟用 RVFI 模式，當 LSU 有讀/寫行為，記錄其地址與掩碼（mask）資訊
+if (IsRVFI) begin
+  if (lsu_rmask_i != 0) begin
+    mem_n[lsu_addr_trans_id_i].sbe.lsu_addr  = lsu_addr_i;
+    mem_n[lsu_addr_trans_id_i].sbe.lsu_rmask = lsu_rmask_i;
+  end else if (lsu_wmask_i != 0) begin
+    mem_n[lsu_addr_trans_id_i].sbe.lsu_addr  = lsu_addr_i;
+    mem_n[lsu_addr_trans_id_i].sbe.lsu_wmask = lsu_wmask_i;
+    mem_n[lsu_addr_trans_id_i].sbe.lsu_wdata = wbdata_i[1];
+  end
+end
+
+// 根據 write-back 資訊更新對應指令狀態（來自執行單元寫回）
+for (int unsigned i = 0; i < CVA6Cfg.NrWbPorts; i++) begin
+  if (wt_valid_i[i] && mem_q[trans_id_i[i]].issued) begin
+    mem_n[trans_id_i[i]].sbe.valid  = 1'b1;
+    mem_n[trans_id_i[i]].sbe.result = wbdata_i[i];
+
+    // 若有啟用 Debug 功能則記錄預測地址
+    if (CVA6Cfg.DebugEn) begin
+      mem_n[trans_id_i[i]].sbe.bp.predict_address = resolved_branch_i.target_address;
+    end
+
+    // CVXIF 特殊處理，若 x_we_i 為 0 表示該指令無 rd，強制設為 0
+    if (mem_n[trans_id_i[i]].sbe.fu == ariane_pkg::CVXIF && ~x_we_i) begin
+      mem_n[trans_id_i[i]].sbe.rd = 5'b0;
+    end
+
+    // 儲存 exception 資訊
+    if (ex_i[i].valid) begin
+      mem_n[trans_id_i[i]].sbe.ex = ex_i[i];
+    end else if (CVA6Cfg.FpPresent &&
+                 mem_q[trans_id_i[i]].sbe.fu inside {ariane_pkg::FPU, ariane_pkg::FPU_VEC}) begin
+      // FPU 例外額外處理
+      mem_n[trans_id_i[i]].sbe.ex.cause = ex_i[i].cause;
+    end
+  end
+end
+
+// ------------------------------------------------------------------------------------------------
+// ✅ Commit Port：收到 commit_ack 後釋放該條目
+// ------------------------------------------------------------------------------------------------
+// 將 ROB 條目釋放，並標記為已完成；若是分支類型的指令，設為 commit_branch_instr 以供 flush 使用
+for (int i = 0; i < CVA6Cfg.NrCommitPorts; i++) begin
+  if (commit_ack_i[i]) begin
+    mem_n[commit_pointer_q[i]].issued    = 1'b0;
+    mem_n[commit_pointer_q[i]].sbe.valid = 1'b0;
+
+    // 若為分支指令（FU == BRANCH = 0b0100）則標記
+    if ((mem_n[commit_pointer_q[i]].sbe.fu == 4'b0100)) begin
+      commit_branch_instr = 1'b1;
+    end
+  end
+end
+```
+
+---
+
+### 📘 說明摘要
+
+這段程式碼處理了三個 Reorder Buffer 相關的更新動作：
+
+1. **立即有效指令判斷**：若功能單元為 NONE，代表不需資源競爭，可直接設為 valid。
+2. **Write-back 操作**：接收執行單元的結果（包含資料與 exception 狀態），並更新對應條目的資訊。
+   - RVFI 模式下會補 LSU trace 資訊（讀/寫地址與遮罩）。
+   - CVXIF 指令若無寫入會清除 rd 欄位。
+3. **Commit 動作處理**：當指令成功寫回時，從 ROB 清除該條目，若為分支指令則記錄其資訊以供 flush 使用。
+
+這部分確保 ROB 條目的更新與釋放符合 CPU 動態指令執行模型，對維持指令準確性和支援分支回溯至關重要。
