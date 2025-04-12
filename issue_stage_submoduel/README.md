@@ -89,7 +89,7 @@ module rob #(
 | Flush 處理    | 輸出 `flush_entry` 等相關資訊以支援整體 pipeline 清空/回復機制          |
 ```
 
-
+---
 ### 🧠 ROB: Register Order Buffer（內部暫存區記憶體）定義與控制信號
 
 ```systemverilog
