@@ -1083,4 +1083,131 @@ assign issue_to_ex[0] = (!issue_instr_i[0].ex.valid && issue_instr_valid_i[0] &&
 assign issue_to_ex[1] = (!issue_instr_i[1].ex.valid && issue_instr_valid_i[1] && issue_ack_o[1]);
 ```
 
+---
+
+### Issue Logic：功能單元資源衝突與暫停判斷
+
+
+```systemverilog
+// =============================================
+// 🧠 說明摘要：
+// 本區負責 Issue 階段的功能單元資源管理與 register 讀取初始化。
+// 1. 若兩條指令使用的功能單元不同，且不違反交叉限制（例如 LOAD+STORE 禁止混發），則可以同時發派（dual issue）
+// 2. 根據指令所屬功能單元檢查對應的 FU 是否 ready，設定 `fu_busy`
+// 3. 同時初始化與 forwarding 有關的 rs1/rs2/rs3 訊號來源與 stall 訊號
+// =============================================
+
+// =============================================
+// 🚦 Issue Logic：功能單元資源衝突與暫停判斷
+// =============================================
+
+// ------------------------------------------------------------------------------------
+// 從 EXCEPTION TVAL 中擷取指令原始位元 (原始指令解碼)
+// 如果是 FPU 指令，從 port 0 擷取；否則擷取 port 1 的指令
+// ------------------------------------------------------------------------------------
+always_comb begin 
+    if((issue_instr_i[0].fu == FPU)) begin 
+      orig_instr = riscv::instruction_t'(issue_instr_i[0].ex.tval[31:0]);
+    end
+    else begin 
+      orig_instr = riscv::instruction_t'(issue_instr_i[1].ex.tval[31:0]);
+    end
+end
+
+// ------------------------------------------------------------------------------------
+// 判斷兩條指令是否能同時 issue
+// - 若功能單元不同，或同為 ALU、MULT 可 dual-issue
+// - 但 LOAD / STORE 不允許混合交叉使用
+// ------------------------------------------------------------------------------------
+logic  issue_ack;
+logic  fu_no_same;
+
+assign fu_no_same = ((issue_instr_i[0].fu != issue_instr_i[1].fu) | 
+                    ((issue_instr_i[0].fu == ALU) & (issue_instr_i[1].fu == ALU))| 
+                    ((issue_instr_i[0].fu == MULT) & (issue_instr_i[1].fu == MULT)))& 
+                    !(((issue_instr_i[0].fu==LOAD) & (issue_instr_i[1].fu==STORE)) | 
+                    ((issue_instr_i[0].fu==STORE) & (issue_instr_i[1].fu==LOAD)));
+
+// ------------------------------------------------------------------------------------
+// 檢查各功能單元是否 Ready
+// - 若可以雙 issue：檢查 port 0 與 port 1 對應的 FU 是否 Ready
+// - 若只能單 issue：僅檢查 port 0，port 1 FU_BUSY 直接設為忙碌
+// ------------------------------------------------------------------------------------
+always_comb begin
+  if(fu_no_same) begin 
+    unique case (issue_instr_i[0].fu)
+      NONE:        fu_busy[0] = 1'b0;
+      ALU:         fu_busy[0] = ~alu0_ready_i;
+      CTRL_FLOW:   fu_busy[0] = ~bu_ready_i;
+      CSR:         fu_busy[0] = ~csr_ready_i;
+      MULT:        fu_busy[0] = ~mult0_ready_i;
+      FPU, FPU_VEC: fu_busy[0] = CVA6Cfg.FpPresent ? ~fpu_ready_i : 1'b0;
+      LOAD, STORE: fu_busy[0] = ~lsu_ready_i;
+      CVXIF:       fu_busy[0] = ~cvxif_ready_i;
+      default:     fu_busy[0] = 1'b0;
+    endcase
+
+    unique case (issue_instr_i[1].fu)
+      NONE:        fu_busy[1] = 1'b0;
+      ALU:         fu_busy[1] = ~alu1_ready_i;
+      CTRL_FLOW:   fu_busy[1] = ~bu_ready_i;
+      CSR:         fu_busy[1] = ~csr_ready_i;
+      MULT:        fu_busy[1] = ~mult1_ready_i;
+      FPU, FPU_VEC: fu_busy[1] = CVA6Cfg.FpPresent ? ~fpu_ready_i : 1'b0;
+      LOAD, STORE: fu_busy[1] = ~lsu_ready_i;
+      CVXIF:       fu_busy[1] = ~cvxif_ready_i;
+      default:     fu_busy[1] = 1'b0;
+    endcase
+  end else begin 
+    // 不能雙 issue，port1 不允許 issue
+    fu_busy[1] = 1'b1;
+    unique case (issue_instr_i[0].fu)
+      NONE:        fu_busy[0] = 1'b0;
+      ALU:         fu_busy[0] = ~alu0_ready_i;
+      CTRL_FLOW:   fu_busy[0] = ~bu_ready_i;
+      CSR:         fu_busy[0] = ~csr_ready_i;
+      MULT:        fu_busy[0] = ~mult0_ready_i;
+      FPU, FPU_VEC: fu_busy[0] = CVA6Cfg.FpPresent ? ~fpu_ready_i : 1'b0;
+      LOAD, STORE: fu_busy[0] = ~lsu_ready_i;
+      CVXIF:       fu_busy[0] = ~cvxif_ready_i;
+      default:     fu_busy[0] = 1'b0;
+    endcase
+  end
+end
+
+// ------------------------------------------------------------------------------------
+// 準備 Register Source 資訊，初始化 forwarding / stall flag
+// rs3 會從 result 欄位取得（因為這是 R4-type 的 encoding）
+// ------------------------------------------------------------------------------------
+always_comb begin
+  forward_rs1[0] = 1'b0;
+  forward_rs2[0] = 1'b0;
+  forward_rs3[0] = 1'b0;  // FPR only
+
+  forward_rs1[1] = 1'b0;
+  forward_rs2[1] = 1'b0;
+  forward_rs3[1] = 1'b0;  // FPR only
+
+  forward_rs1_fu_n[0] = 4'd0;
+  forward_rs2_fu_n[0] = 4'd0;
+  forward_rs1_fu_n[1] = 4'd0;
+  forward_rs2_fu_n[1] = 4'd0;
+
+  stall_rs1[0]     = stall_i;
+  stall_rs2[0]     = stall_i;
+  stall_csr[0]     = stall_i;
+  stall_rs1[1]     = stall_i;
+  stall_rs2[1]     = stall_i;
+  stall_csr[1]     = stall_i;
+
+  rs1_o[0] = issue_instr_i[0].rs1;
+  rs2_o[0] = issue_instr_i[0].rs2;
+  rs3_o[0] = issue_instr_i[0].result[REG_ADDR_SIZE-1:0];
+
+  rs1_o[1] = issue_instr_i[1].rs1;
+  rs2_o[1] = issue_instr_i[1].rs2;
+  rs3_o[1] = issue_instr_i[1].result[REG_ADDR_SIZE-1:0];
+end
+```
+
 
