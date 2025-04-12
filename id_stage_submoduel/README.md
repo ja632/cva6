@@ -216,6 +216,7 @@ always_ff @(posedge clk_i or negedge rst_ni) begin
     end
 end
 ```
+---
 ### 🔄 Busytable 子模組初始化與定義區塊
 
 ```systemverilog
@@ -302,6 +303,7 @@ logic full;
 | `busy_rs1/rs2`                  | 用來標示來源暫存器是否尚未就緒（尚在計算中）                                 |
 | `full`                          | 當所有暫存器皆為 busy 時，表示 busytable 滿載，可能需 stall pipeline           |
 
+---
 ### 🔁 Busytable - Push/Pop 與狀態更新邏輯
 
 ```systemverilog
@@ -372,7 +374,7 @@ end
 | flush_unissued | 發生 branch mispredict 時，透過快照還原 busytable |
 | 強制清除 | x0 寄存器永遠設為 0，避免誤標 busy                    |
 
-
+---
 ### 🔁 Busytable - Forwarding 機制與來源暫存器決策邏輯
 
 ```systemverilog
