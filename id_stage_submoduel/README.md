@@ -1065,3 +1065,147 @@ end
 | `mux_rsX`  | 為是否成功從 map table 中查找到對應條目（避免誤用 x0）               |
 | 條件邏輯   | 需同時比對 `virtual_addr`、`is_forward` 和是否整數/浮點一致性判斷       |
 
+### 🔁 Map Table 更新邏輯（map_table_q 實體更新）
+
+```systemverilog
+// ------------------------------------------------------------------------------------------------
+//  update map table
+// ------------------------------------------------------------------------------------------------
+always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (~rst_ni) begin
+        // 非同步 reset，清除整個 map_table
+        for (int unsigned j = 0; j < CVA6Cfg.Nrmaptable; j++) begin
+            map_table_q[j] <= 'd0;
+        end
+    end else if(flush_i) begin
+        // 若整體 flush（例如發生 trap），map_table 被清空
+        for (int unsigned j = 0; j < CVA6Cfg.Nrmaptable; j++) begin
+            map_table_q[j] <= 'd0;
+        end
+    end else begin
+        // 正常時更新 map_table 為計算好的新版本 map_table_n
+        map_table_q <= map_table_n;
+    end 
+end
+```
+
+---
+
+### 🧠 分支快照（Branch Snapshot）保存 map table 狀態
+
+```systemverilog
+// 判斷是否為 branch 或 jalr 指令（兩條 issue port）
+assign issue_is_branch[0] = (br_instr_i[0] & issue_instr_valid_i[0] & issue_ack_o[0]);
+assign issue_is_branch[1] = (br_instr_i[1] & issue_instr_valid_i[1] & issue_ack_o[1]);
+
+// snapshot 邏輯：會將 map_table_q 的狀態備份到 br_snapshot 中
+always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (~rst_ni) begin
+        // 初始化所有 snapshot 資料
+        for (int unsigned j = 0; j < CVA6Cfg.Nrmaptable; j++) begin
+            for (int unsigned k = 0; k < 16; k++) begin
+                br_snopshot[k][j] <= 'd0;
+            end
+        end
+    end else begin
+        // --- Case 1: 同時發派兩條分支指令，需存兩份 snapshot ---
+        if(issue_is_branch[0] & issue_is_branch[1]) begin
+            // br_push_ptr 與 br_push_ptr+1 都需紀錄對應快照狀態
+            for (int unsigned j = 0; j < CVA6Cfg.Nrmaptable; j++) begin
+                // 根據 issue/commit 狀態優先更新 snapshot 資料
+                // 若當下就發派，直接用 map_table_n；若是 commit 則清空；否則複製現況
+                if(issue_enable[0] & (j==issue_ptr[0])) begin 
+                    br_snopshot[br_push_ptr][j] <= map_table_n[j];
+                end else if(commit_enable[0] & (j==commit_ptr[0]) || commit_enable[1] & (j==commit_ptr[1])) begin 
+                    br_snopshot[br_push_ptr][j] <= 'd0;
+                end else begin 
+                    // 檢查若這個項目在當下被 issue 指令覆蓋，則 snapshot 內 is_forward 必須清除為 0（無效）
+                    if(issue_enable[0] & (map_table_q[j].virtual_addr==issue_rd[0]) &
+                       map_table_q[j].is_forward & (is_rd_fpr(issue_instr_i[0].op) == map_table_n[j].is_float)) begin 
+                        br_snopshot[br_push_ptr][j].is_float     <= map_table_q[j].is_float;
+                        br_snopshot[br_push_ptr][j].is_forward   <= 1'd0;
+                        br_snopshot[br_push_ptr][j].virtual_addr <= issue_rd[0];
+                    end else begin 
+                        br_snopshot[br_push_ptr][j] <= map_table_q[j];
+                    end
+                end       
+            end
+
+            // 第二條分支指令用 br_push_ptr+1 快照
+            for (int unsigned j = 0; j < CVA6Cfg.Nrmaptable; j++) begin
+                if(issue_enable[0] & (j==issue_ptr[0]) || issue_enable[1] & (j==issue_ptr[1])) begin 
+                    br_snopshot[br_push_ptr+1][j] <= map_table_n[j];
+                end else if(commit_enable[0] & (j==commit_ptr[0]) || commit_enable[1] & (j==commit_ptr[1])) begin 
+                    br_snopshot[br_push_ptr+1][j] <= 'd0;
+                end else begin 
+                    // 清除過時的 is_forward
+                    if(issue_enable[1] & (map_table_q[j].virtual_addr==issue_rd[1]) &
+                       map_table_q[j].is_forward & (is_rd_fpr(issue_instr_i[1].op) == map_table_n[j].is_float)) begin 
+                        br_snopshot[br_push_ptr+1][j].is_float     <= map_table_q[j].is_float;
+                        br_snopshot[br_push_ptr+1][j].is_forward   <= 1'd0;
+                        br_snopshot[br_push_ptr+1][j].virtual_addr <= issue_rd[1];
+                    end else begin 
+                        br_snopshot[br_push_ptr+1][j] <= map_table_q[j];
+                    end
+                end
+            end
+        end
+        // --- Case 2: 只有一條分支指令 ---
+        else if(issue_is_branch[0]) begin 
+            for (int unsigned j = 0; j < CVA6Cfg.Nrmaptable; j++) begin
+                if(issue_enable[0] & (j==issue_ptr[0])) begin 
+                    br_snopshot[br_push_ptr][j] <= map_table_n[j];
+                end else if(commit_enable[0] & (j==commit_ptr[0]) || commit_enable[1] & (j==commit_ptr[1])) begin 
+                    br_snopshot[br_push_ptr][j] <= 'd0;
+                end else begin 
+                    // 與前面類似，檢查需清除 forward 標記
+                    if(issue_enable[0] & (map_table_q[j].virtual_addr==issue_rd[0]) &
+                       map_table_q[j].is_forward & (is_rd_fpr(issue_instr_i[0].op) == map_table_n[j].is_float)) begin 
+                        br_snopshot[br_push_ptr][j].is_float     <= map_table_q[j].is_float;
+                        br_snopshot[br_push_ptr][j].is_forward   <= 1'd0;
+                        br_snopshot[br_push_ptr][j].virtual_addr <= issue_rd[0];
+                    end else begin 
+                        br_snopshot[br_push_ptr][j] <= map_table_q[j];
+                    end
+                end
+            end
+        end
+        // --- Case 3: 其他非分支指令也要保留當下快照（為了 mispredict recovery）---
+        else begin 
+            for (int unsigned j = 0; j < CVA6Cfg.Nrmaptable; j++) begin
+                if(issue_enable[0] & (j==issue_ptr[0]) || issue_enable[1] & (j==issue_ptr[1])) begin 
+                    br_snopshot[br_push_ptr][j] <= map_table_n[j];
+                end else if(commit_enable[0] & (j==commit_ptr[0]) || commit_enable[1] & (j==commit_ptr[1])) begin 
+                    br_snopshot[br_push_ptr][j] <= 'd0;
+                end else begin 
+                    // 與上面相同，針對多種 forward 的情形做快照處理
+                    if(issue_enable[0] & (map_table_q[j].virtual_addr==issue_rd[0]) &
+                       map_table_q[j].is_forward & (is_rd_fpr(issue_instr_i[0].op) == map_table_n[j].is_float)) begin 
+                        br_snopshot[br_push_ptr][j].is_float     <= map_table_q[j].is_float;
+                        br_snopshot[br_push_ptr][j].is_forward   <= 1'd0;
+                        br_snopshot[br_push_ptr][j].virtual_addr <= issue_rd[0];
+                    end else if(issue_enable[1] & (map_table_q[j].virtual_addr==issue_rd[1]) &
+                                map_table_q[j].is_forward & (is_rd_fpr(issue_instr_i[1].op) == map_table_n[j].is_float)) begin 
+                        br_snopshot[br_push_ptr][j].is_float     <= map_table_q[j].is_float;
+                        br_snopshot[br_push_ptr][j].is_forward   <= 1'd0;
+                        br_snopshot[br_push_ptr][j].virtual_addr <= issue_rd[1];
+                    end else begin 
+                        br_snopshot[br_push_ptr][j] <= map_table_q[j];
+                    end
+                end   
+            end
+        end
+    end
+end
+```
+
+---
+
+### 📘 小結：Map Table 快照用途
+
+| 狀況 | 行為 | 備註 |
+|------|------|------|
+| Branch / JALR 發派 | 建立 snapshot | 支援未來 flush 還原 |
+| 發派與 commit 同時發生 | snapshot 需同時考慮兩者 | 保證 forward 清除準確 |
+| 處理 forwarding 清除 | snapshot 清除 is_forward | 避免後續錯誤依賴 |
+
