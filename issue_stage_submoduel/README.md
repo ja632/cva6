@@ -769,4 +769,68 @@ end
 
 ---
 
+### ROB Operand Forwarding: 從 Writeback 和 ROB 中選擇最新的 RS 資料來源
 
+```systemverilog
+// =====================================================================================================
+// 🔁 ROB Operand Forwarding: 從 Writeback 和 ROB 中選擇最新的 RS 資料來源
+// =====================================================================================================
+
+// ------------------------------------------------------------------------------------------------------
+// ⚙️ Operand Forwarding 與讀取邏輯（Read Operands）
+// ------------------------------------------------------------------------------------------------------
+
+// ➤ ROB Entries forwarding 論證：補足從 ROB 中能夠 forwarding 的來源條件。
+for (genvar k = 0; unsigned'(k) < NR_ENTRIES; k++) begin 
+  assign rs1_fwd_req[0][k+CVA6Cfg.NrWbPorts] = (mem_q[k].sbe.rd == rs1_i[0]) & mem_q[k].issued & mem_q[k].sbe.valid & (mem_q[k].is_rd_fpr_flag == (CVA6Cfg.FpPresent && ariane_pkg::is_rs1_fpr(issue_instr_o[0].op)));
+  assign rs2_fwd_req[0][k+CVA6Cfg.NrWbPorts] = (mem_q[k].sbe.rd == rs2_i[0]) & mem_q[k].issued & mem_q[k].sbe.valid & (mem_q[k].is_rd_fpr_flag == (CVA6Cfg.FpPresent && ariane_pkg::is_rs2_fpr(issue_instr_o[0].op)));
+  assign rs3_fwd_req[0][k+CVA6Cfg.NrWbPorts] = (mem_q[k].sbe.rd == rs3_i[0]) & mem_q[k].issued & mem_q[k].sbe.valid & (mem_q[k].is_rd_fpr_flag == (CVA6Cfg.FpPresent && ariane_pkg::is_imm_fpr(issue_instr_o[0].op)));
+
+  assign rs1_fwd_req[1][k+CVA6Cfg.NrWbPorts] = (mem_q[k].sbe.rd == rs1_i[1]) & mem_q[k].issued & mem_q[k].sbe.valid & (mem_q[k].is_rd_fpr_flag == (CVA6Cfg.FpPresent && ariane_pkg::is_rs1_fpr(issue_instr_o[1].op)));
+  assign rs2_fwd_req[1][k+CVA6Cfg.NrWbPorts] = (mem_q[k].sbe.rd == rs2_i[1]) & mem_q[k].issued & mem_q[k].sbe.valid & (mem_q[k].is_rd_fpr_flag == (CVA6Cfg.FpPresent && ariane_pkg::is_rs2_fpr(issue_instr_o[1].op)));
+  assign rs3_fwd_req[1][k+CVA6Cfg.NrWbPorts] = (mem_q[k].sbe.rd == rs3_i[1]) & mem_q[k].issued & mem_q[k].sbe.valid & (mem_q[k].is_rd_fpr_flag == (CVA6Cfg.FpPresent && ariane_pkg::is_imm_fpr(issue_instr_o[1].op)));
+
+  assign rs_data[k+CVA6Cfg.NrWbPorts] = mem_q[k].sbe.result;
+end
+
+// ➤ rs1/rs2/rs3 有效性判斷：若 rs1 是 x0，要排除除非是浮點
+assign rs1_valid_o[0] = rs1_valid[0] & ((|rs1_i[0]) | (CVA6Cfg.FpPresent && ariane_pkg::is_rs1_fpr(issue_instr_o[0].op)));
+assign rs2_valid_o[0] = rs2_valid[0] & ((|rs2_i[0]) | (CVA6Cfg.FpPresent && ariane_pkg::is_rs2_fpr(issue_instr_o[0].op)));
+assign rs3_valid_o[0] = CVA6Cfg.NrRgprPorts == 3 ? rs3_valid[0] & ((|rs3_i[0]) | (CVA6Cfg.FpPresent && ariane_pkg::is_imm_fpr(issue_instr_o[0].op))) : rs3_valid[0];
+
+assign rs1_valid_o[1] = rs1_valid[1] & ((|rs1_i[1]) | (CVA6Cfg.FpPresent && ariane_pkg::is_rs1_fpr(issue_instr_o[1].op)));
+assign rs2_valid_o[1] = rs2_valid[1] & ((|rs2_i[1]) | (CVA6Cfg.FpPresent && ariane_pkg::is_rs2_fpr(issue_instr_o[1].op)));
+assign rs3_valid_o[1] = CVA6Cfg.NrRgprPorts == 3 ? rs3_valid[1] & ((|rs3_i[1]) | (CVA6Cfg.FpPresent && ariane_pkg::is_imm_fpr(issue_instr_o[1].op))) : rs3_valid[1];
+
+// ➤ 使用 rr_arb_tree 做資料選擇（forwarding arbiter）：WB > ROB
+rr_arb_tree #(.NumIn(NR_ENTRIES + CVA6Cfg.NrWbPorts), .DataWidth(riscv::XLEN), .ExtPrio(1'b1), .AxiVldRdy(1'b1)) i_sel_rs1_0 (...);
+rr_arb_tree #(.NumIn(NR_ENTRIES + CVA6Cfg.NrWbPorts), .DataWidth(riscv::XLEN), .ExtPrio(1'b1), .AxiVldRdy(1'b1)) i_sel_rs2_0 (...);
+rr_arb_tree #(.NumIn(NR_ENTRIES + CVA6Cfg.NrWbPorts), .DataWidth(riscv::XLEN), .ExtPrio(1'b1), .AxiVldRdy(1'b1)) i_sel_rs3_0 (...);
+rr_arb_tree #(.NumIn(NR_ENTRIES + CVA6Cfg.NrWbPorts), .DataWidth(riscv::XLEN), .ExtPrio(1'b1), .AxiVldRdy(1'b1)) i_sel_rs1_1 (...);
+rr_arb_tree #(.NumIn(NR_ENTRIES + CVA6Cfg.NrWbPorts), .DataWidth(riscv::XLEN), .ExtPrio(1'b1), .AxiVldRdy(1'b1)) i_sel_rs2_1 (...);
+rr_arb_tree #(.NumIn(NR_ENTRIES + CVA6Cfg.NrWbPorts), .DataWidth(riscv::XLEN), .ExtPrio(1'b1), .AxiVldRdy(1'b1)) i_sel_rs3_1 (...);
+
+// ➤ 處理 rs3_o 根據 FLen 和 XLEN 輸出不同長度
+if (CVA6Cfg.NrRgprPorts == 3) begin
+  assign rs3_o[0] = rs3[0][riscv::XLEN-1:0];
+  assign rs3_o[1] = rs3[1][riscv::XLEN-1:0];
+end else begin
+  assign rs3_o[0] = rs3[0][CVA6Cfg.FLen-1:0];
+  assign rs3_o[1] = rs3[1][CVA6Cfg.FLen-1:0];
+end
+```
+
+---
+
+### 📘 說明摘要：ROB Operand Forwarding 機制
+
+這一段是 **發出單元從 ROB 與 WB 取得運算元值的 forwarding 邏輯**，目的在於：
+
+- 提供 rs1/rs2/rs3 operand 的最新值
+- 支援整數與浮點暫存器的 forwarding 判斷
+- 優先使用 WB port 的結果（避免 stall）
+- 允許多執行緒同時比對運算元與追蹤發出狀態
+
+✅ `rr_arb_tree` 的作用是優雅選出最新資料來源，若之後要視覺化其運作或補充圖解，也可以幫你補上。
+
+---
