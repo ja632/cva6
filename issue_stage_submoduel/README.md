@@ -87,10 +87,11 @@ module rob #(
 | Exception    | 接收分支解決與 LSU 地址，用於 trigger flush 或 exception 處理            |
 | Forwarding   | 回傳 forwarding 值給 ALU、LSU、FPU 等單元                                |
 | Flush 處理    | 輸出 `flush_entry` 等相關資訊以支援整體 pipeline 清空/回復機制          |
-```
 
----
+
+
 ### 🧠 ROB: Register Order Buffer（內部暫存區記憶體）定義與控制信號
+
 
 ```systemverilog
 localparam int unsigned BITS_ENTRIES = $clog2(NR_ENTRIES);  // 根據 rob 大小決定編號位元數
@@ -176,4 +177,5 @@ assign flush_branch_mispredict_plus = (trans_id_i[6]==4'd15) ? 3'd0 : (trans_id_
 // 暫存解碼指令
 // ------------------------------------------------------------------------------------
 ariane_pkg::scoreboard_entry_t [1:0] decoded_instr;  // 暫存 port 0 與 port 1 的指令
+
 ```
