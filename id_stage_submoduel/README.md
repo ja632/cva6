@@ -302,3 +302,73 @@ logic full;
 | `busy_rs1/rs2`                  | 用來標示來源暫存器是否尚未就緒（尚在計算中）                                 |
 | `full`                          | 當所有暫存器皆為 busy 時，表示 busytable 滿載，可能需 stall pipeline           |
 
+### 🔁 Busytable - Push/Pop 與狀態更新邏輯
+
+```systemverilog
+// ------------------------------------------------------------------------------------------------
+// push / pop signal
+// ------------------------------------------------------------------------------------------------
+
+// 判斷是否發派成功且需要 rename
+assign issue_enable[0] = issue_instr_valid_i[0] & issue_ack_o[0] & !no_rename_i[0];
+assign issue_enable[1] = issue_instr_valid_i[1] & issue_ack_o[1] & !no_rename_i[1];
+
+// 當前要 mark 成 busy 的暫存器 index
+assign issue_ptr[0] = Pr_rd_o_rob[0];
+assign issue_ptr[1] = Pr_rd_o_rob[1];
+
+// 判斷是否為有效的寫回（commit）指令
+assign commit_enable[0] = commit_instr_o[0].valid & commit_ack_i[0] & (commit_instr_o[0].rd != 6'd0);
+assign commit_enable[1] = commit_instr_o[1].valid & commit_ack_i[1] & (commit_instr_o[1].rd != 6'd0);
+
+// 要從 busytable 中釋放的實體暫存器 index
+assign commit_ptr[0] = commit_instr_o[0].rd[4:0];
+assign commit_ptr[1] = commit_instr_o[1].rd[4:0];
+
+// ------------------------------------------------------------------------------------------------
+// 更新 busytable 狀態
+// ------------------------------------------------------------------------------------------------
+always_comb begin
+    physical_register_busytable_n = physical_register_busytable_q;
+
+    // 若發生 flush_unissied_instr_i（如 branch mispredict），從快照還原 busytable 狀態
+    if(flush_unissied_instr_i) begin
+        for (int unsigned j = 0; j < CVA6Cfg.Nrmaptable; j++) begin
+            if(physical_register_busytable_q[j] != 1'd0) begin 
+                physical_register_busytable_n[j] = br_snopshot_busytable[br_pop_ptr][j];
+            end
+        end
+    end 
+
+    // 發派時將對應實體暫存器設為 busy
+    if(issue_enable[0]) begin
+        physical_register_busytable_n[issue_ptr[0]] = 1'd1;
+    end
+    if(issue_enable[1]) begin
+        physical_register_busytable_n[issue_ptr[1]] = 1'd1;
+    end 
+
+    // 寫回時將對應暫存器從 busytable 移除（標記為 idle）
+    if(commit_enable[0]) begin 
+        physical_register_busytable_n[commit_ptr[0]] = 1'd0;
+    end
+    if(commit_enable[1]) begin 
+        physical_register_busytable_n[commit_ptr[1]] = 1'd0;
+    end
+
+    // x0 寄存器永遠不可被標記為 busy
+    physical_register_busytable_n[0] = 1'd0;
+end
+```
+
+---
+
+### 📘 小結：Busytable 更新邏輯
+
+| 操作階段 | 動作內容                                       |
+|----------|------------------------------------------------|
+| 發派 (issue) | 將 `rd` 對應的實體暫存器標記為 busy (1)             |
+| 寫回 (commit) | 將 `rd` 回收時從 busytable 中釋放 (設為 0)         |
+| flush_unissued | 發生 branch mispredict 時，透過快照還原 busytable |
+| 強制清除 | x0 寄存器永遠設為 0，避免誤標 busy                    |
+
