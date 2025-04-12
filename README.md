@@ -796,3 +796,136 @@ end
 - `busytable`：追蹤哪個 register 被占用中（busy）
 - `maptable`：追蹤 architectural ↔ physical 對應
 - `freelist`：回收已經不用的 physical register 並分配給新指令
+
+
+### 🚦 Issue Stage Module 介面說明與註解
+
+```systemverilog
+module issue_stage
+  import ariane_pkg::*;
+#(
+    parameter config_pkg::cva6_cfg_t CVA6Cfg = config_pkg::cva6_cfg_empty,  // 設定參數
+    parameter bit IsRVFI = bit'(0),  // 是否開啟 RVFI
+    parameter int unsigned NR_ENTRIES = 8  // Issue Queue 大小
+) (
+    input  logic clk_i,                     // 時鐘訊號
+    input  logic rst_ni,                    // 非同步 reset (active low)
+
+    output logic sb_full_o,                 // scoreboard 是否已滿，阻止新的指令進入
+    input  logic flush_unissued_instr_i,    // flush 未發出的指令（如分支錯誤）
+    input  logic flush_i,                   // 完全 flush 所有狀態
+    input  logic stall_i,                   // 上游 stall 訊號（如 pipeline 停止）
+
+    // 從 rename stage 接收的指令（含壓縮）
+    input scoreboard_entry_t[CVA6Cfg.NrissuePorts-1:0] rename_instr_i,      // 指令資訊
+    input logic [CVA6Cfg.NrissuePorts-1:0] rename_instr_valid_i,           // 指令有效位元
+    input logic [CVA6Cfg.NrissuePorts-1:0] is_ctrl_flow_i,                 // 是否為控制流（如 branch）
+    output logic [CVA6Cfg.NrissuePorts-1:0] rename_instr_ack_o,           // issue stage 是否接受該指令
+    output logic [CVA6Cfg.NrissuePorts-1:0] is_compressed_instr_o,        // 該指令是否為 RVC (壓縮指令)
+
+    // 發送至 Forwarding 單元的 source register 映射
+    output logic [riscv::VLEN-1:0][CVA6Cfg.NrissuePorts-1:0] rs1_forwarding_o, // rs1 forwarding 資訊
+    output logic [riscv::VLEN-1:0][CVA6Cfg.NrissuePorts-1:0] rs2_forwarding_o, // rs2 forwarding 資訊
+    output logic [riscv::VLEN-1:0][CVA6Cfg.NrissuePorts-1:0] pc_o,             // PC forwarding 資訊
+    output fu_data_t [CVA6Cfg.NrissuePorts-1:0] fu_data_o,                     // 發給 Functional Unit 的資料
+
+    // 各功能單元就緒訊號（用來判斷是否可發）
+    input  logic resolve_branch_i,  // 是否已完成分支解析
+    input  logic lsu_ready_i,       // LSU 單元就緒
+    input  logic fpu_ready_i,       // FPU 單元就緒
+    input  logic alu0_ready_i,      // ALU0 單元就緒
+    input  logic alu1_ready_i,      // ALU1 單元就緒
+    input  logic bu_ready_i,        // Branch Unit 就緒
+    input  logic csr_ready_i,       // CSR 就緒
+    input  logic mult0_ready_i,     // Multiplier0 就緒
+    input  logic mult1_ready_i,     // Multiplier1 就緒
+
+    // 各功能單元是否將發出指令
+    output logic alu0_valid_o,
+    output logic alu1_valid_o,
+    output logic lsu_valid_o,
+    output logic branch_valid_o,
+    output branchpredict_sbe_t branch_predict_o,  // 分支預測結果輸出
+    output logic mult0_valid_o,
+    output logic mult1_valid_o,
+    output logic fpu_valid_o,
+    output logic [1:0] fpu_fmt_o,  // 浮點數格式（single/double）
+    output logic [2:0] fpu_rm_o,   // 浮點數捨入模式
+    output logic csr_valid_o,
+
+    // 加速器指令發送訊號
+    output logic x_issue_valid_o,     // 是否發送 custom extension 指令
+    input  logic x_issue_ready_i,     // custom unit 是否可接收
+    output logic [31:0] x_off_instr_o,// 傳送的 custom extension 指令
+
+    // 發送給加速器的指令內容
+    output scoreboard_entry_t issue_instr_o,   // 發出的 scoreboard entry
+    output logic issue_instr_hs_o,             // 是否成功 handshake（代表實際發出）
+
+    // 寫回資訊
+    input logic [CVA6Cfg.NrWbPorts-1:0][TRANS_ID_BITS-1:0] trans_id_i,      // 寫回的 transaction ID
+    input bp_resolve_t resolved_branch_i,                                 // 分支解析結果
+    input logic [CVA6Cfg.NrWbPorts-1:0][riscv::XLEN-1:0] wbdata_i,         // 寫回的資料
+
+    // 從執行單元或 custom extension 傳來的例外資訊
+    `ifdef sim
+    input exception_t [CVA6Cfg.NrWbPorts-1:0] ex_ex_i,
+    `else
+    input exception_t [31:0] ex_ex_i,
+    `endif
+    input logic [CVA6Cfg.NrWbPorts-1:0] wt_valid_i,   // 寫回有效
+    input logic x_we_i,                              // custom 寫入有效
+
+    // commit stage 資訊（寫入 GPR/FPR）
+    input logic [CVA6Cfg.NrCommitPorts-1:0][5:0] physical_waddr_i,  // 寫回實體暫存器
+    input logic [CVA6Cfg.NrCommitPorts-1:0][riscv::XLEN-1:0] wdata_i, // 寫回資料
+    input logic [CVA6Cfg.NrCommitPorts-1:0] we_gpr_i,    // GPR 寫入有效
+    input logic [CVA6Cfg.NrCommitPorts-1:0] we_fpr_i,    // FPR 寫入有效
+
+    // commit 給 scoreboard 的資料與回應
+    `ifdef sim
+    output scoreboard_entry_t [CVA6Cfg.NrCommitPorts-1:0] commit_instr_o,
+    `else
+    output scoreboard_entry_t [31:0] commit_instr_o,
+    `endif
+    input  logic [CVA6Cfg.NrCommitPorts-1:0] commit_ack_i,
+
+    // Performance Counter 用的 stall 訊號
+    output logic stall_issue_o,
+    output logic [CVA6Cfg.NrCommitPorts-1:0][REG_ADDR_SIZE-1:0] waddr_final,
+
+    // 對應 rename 傳來的 virtual register 資訊
+    input logic [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-1:0] virtual_waddr_i,
+
+    // source register 的實體對應
+    output logic [CVA6Cfg.NrissuePorts-1:0][5:0] rs1_physical,
+    output logic [CVA6Cfg.NrissuePorts-1:0][5:0] rs2_physical,
+    output logic [CVA6Cfg.NrissuePorts-1:0][5:0] rs3_physical,
+    input  logic [CVA6Cfg.NrissuePorts-1:0][4:0] rs1_virtual,
+    input  logic [CVA6Cfg.NrissuePorts-1:0][4:0] rs2_virtual,
+    input  logic [CVA6Cfg.NrissuePorts-1:0][4:0] rs3_virtual,
+
+    // RVFI 模擬用記錄 lsu 操作資訊
+    input [riscv::VLEN-1:0] lsu_addr_i,
+    input [(riscv::XLEN/8)-1:0] lsu_rmask_i,
+    input [(riscv::XLEN/8)-1:0] lsu_wmask_i,
+    input [ariane_pkg::TRANS_ID_BITS-1:0] lsu_addr_trans_id_i,
+
+    // 用於 flush issue queue
+    output logic [NR_ENTRIES-1:0] flush_entry,          // flush 哪些 entries
+    output logic [NR_ENTRIES-1:0][3:0] flush_fu,        // flush 的功能單元編號
+    output logic [NR_ENTRIES-1:0][3:0] flush_trans_id,  // flush 的 transaction ID
+    output logic [NR_ENTRIES-1:0][63:0] flush_lsu_addr  // flush 時需清除的 lsu 地址
+);
+```
+
+---
+
+### 📝 總結
+這個模組是處理從 rename 到實際 functional unit 的發派（issue）階段核心元件：
+- **接收** rename 結果並將指令存入 scoreboard / issue queue。
+- **判斷** 各功能單元是否就緒與能否接受該指令。
+- **管理** flush、分支錯誤、custom extension 發送、轉發資訊等。
+
+後續若要追蹤功能實作，可進一步往內看 Issue Queue、Scoreboard、Functional Dispatch 的邏輯。
+
