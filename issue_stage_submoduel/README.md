@@ -314,4 +314,131 @@ end
 
 此邏輯確保當分支預測錯誤時，能夠正確識別哪些指令需要清除並避免非法寫回。
 
+---
+
+### 🚀 Issue 入口與 ROB 更新邏輯
+
+```systemverilog
+// ------------------------------------------------------------------------------------------------
+// 🧠 Issue Path Preparation and Trans ID Allocation
+// ------------------------------------------------------------------------------------------------
+// 這段 always_comb 負責將 rename 階段送進來的指令準備好輸出給 issue_read_operands 模組，
+// 並根據是否允許 dual issue 決定是否同時發派兩條指令。
+
+always_comb begin
+    rs1[0]                        = '0;
+    rs1[1]                        = '0;
+    rs2[0]                        = '0;
+    rs2[1]                        = '0;
+
+    issue_instr_o[0]              = '0;
+    issue_instr_o[0].trans_id     = '0;
+    issue_instr_valid_o[0]        = '0;
+    decoded_instr_ack_o[0]        = '0;
+
+    issue_instr_o[1]              = '0;
+    issue_instr_o[1].trans_id     = '0;
+    issue_instr_valid_o[1]        = '0;
+    decoded_instr_ack_o[1]        = '0;
+
+    if(enable_dual_issue) begin 
+      // 若允許雙發派，準備兩條指令
+      issue_instr_o[0]            = decoded_instr_i[0];
+      issue_instr_o[0].rs1        = (rs1[0]!='0) ? rs1[0] : decoded_instr_i[0].rs1;
+      issue_instr_o[0].rs2        = (rs2[0]!='0) ? rs2[0] : decoded_instr_i[0].rs2;
+      issue_instr_valid_o[0]      = decoded_instr_valid_i[0] & ~unresolved_branch_i;
+      decoded_instr_ack_o[0]      = issue_ack_i[0];
+      issue_instr_o[0].trans_id   = issue_pointer_q;
+          
+      issue_instr_o[1]            = decoded_instr_i[1];
+      issue_instr_o[1].rs1        = (rs1[1]!='0) ? rs1[1] : decoded_instr_i[1].rs1;
+      issue_instr_o[1].rs2        = (rs2[1]!='0) ? rs2[1] : decoded_instr_i[1].rs2;
+      issue_instr_valid_o[1]      = decoded_instr_valid_i[1] & ~unresolved_branch_i;
+      decoded_instr_ack_o[1]      = issue_ack_i[1];
+      issue_instr_o[1].trans_id   = issue_pointer_q + 1;
+    end else begin 
+      // 單發派邏輯
+      issue_instr_o[0]            = decoded_instr_i[0];
+      issue_instr_o[0].rs1        = (rs1[0]!='0) ? rs1[0] : decoded_instr_i[0].rs1;
+      issue_instr_o[0].rs2        = (rs2[0]!='0) ? rs2[0] : decoded_instr_i[0].rs2;
+      issue_instr_o[0].trans_id   = issue_pointer_q;
+      issue_instr_valid_o[0]      = decoded_instr_valid_i[0] & ~unresolved_branch_i & ~issue_full;
+      decoded_instr_ack_o[0]      = issue_ack_i[0] & ~issue_full;
+    end
+end
+
+// ------------------------------------------------------------------------------------------------
+// 🧾 Reorder Buffer 記憶體更新邏輯
+// ------------------------------------------------------------------------------------------------
+// 根據是否成功發派 instruction，將其存入 mem_n（下一個 ROB buffer 狀態）
+// 若啟用 FPU 功能並判定為 FPR 寫入，會標示 is_rd_fpr_flag。
+
+always_comb begin
+    mem_n                   = mem_q;  // 預設保留現況
+    issue_en_0              = 1'b0;
+    issue_en_1              = 1'b0;
+    commit_branch_instr     = 2'd0;
+    flush_instr             = 1'd0;
+    flush_entry_n           = 16'd0;
+
+    for (int unsigned i = 0; i < NR_ENTRIES; i++) begin
+      flush_fu_n      [i] = '0;
+      flush_trans_id_n[i] = '0;
+      flush_lsu_addr_n[i] = '0;
+    end
+
+    // ------------------------------------------------------------------------------------
+    // Issue Port
+    // ------------------------------------------------------------------------------------
+    if (((decoded_instr_valid_i[0] && decoded_instr_ack_o[0]) & (decoded_instr_valid_i[1] && decoded_instr_ack_o[1])) & !flush_unissued_instr_i) begin
+      issue_en_0 = 1'b1;
+      issue_en_1 = 1'b1;
+      
+      mem_n[issue_pointer_q] = {
+        1'b1, 
+        (CVA6Cfg.FpPresent && ariane_pkg::is_rd_fpr(
+          decoded_instr_i[0].op
+        )),  
+        decoded_instr[0]  
+      };
+      mem_n[issue_pointer_plus] = {
+        1'b1,
+        (CVA6Cfg.FpPresent && ariane_pkg::is_rd_fpr(
+          decoded_instr_i[1].op
+        )),  
+        decoded_instr[1] 
+      };
+    end else if ((decoded_instr_valid_i[0] && decoded_instr_ack_o[0]) & !flush_unissued_instr_i) begin
+      issue_en_0 = 1'b1;
+
+      mem_n[issue_pointer_q] = {
+        1'b1, 
+        (CVA6Cfg.FpPresent && ariane_pkg::is_rd_fpr(
+          decoded_instr_i[0].op
+        )),
+        decoded_instr[0]
+      };
+    end
+end
+```
+
+---
+
+### 📘 說明摘要
+
+這段程式碼負責將 decode 階段送入的指令準備轉發至 Issue 單元，並同步更新 ROB（Reorder Buffer）：
+
+1. **Issue 發派邏輯**：
+   - 若支援 Dual Issue，並且兩條指令都有效且可接受，則同時發派兩條。
+   - 否則只發派第一條指令。
+   - 同時會對 rs1/rs2 處理 forwarding，避免依賴錯誤值。
+
+2. **trans_id 記錄**：每條指令會記錄在 ROB 中的索引作為其 transaction ID。
+
+3. **ROB Buffer 寫入**：
+   - 寫入時標記 `issued=1`，並根據是否為浮點寫入，設定 `is_rd_fpr_flag`。
+   - 寫入目的地址為 `issue_pointer_q` 或其遞增版。
+
+這些機制確保後續執行單元可以正確讀取對應的寄存器值與指令內容，也為 commit 與 flush 提供基礎依據。
+
 
