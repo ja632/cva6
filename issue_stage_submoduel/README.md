@@ -670,3 +670,103 @@ end
 
 ---
 
+### 🧠 ROB Register Clobber 與 Forwarding 機制說明
+
+```systemverilog
+// -----------------------------------------------------------------------------------------------
+// RD clobber process
+// -----------------------------------------------------------------------------------------------
+logic            [2**ariane_pkg::REG_ADDR_SIZE-1:0][NR_ENTRIES:0] gpr_clobber_vld;   // GPR 被覆蓋的記錄
+logic            [2**ariane_pkg::REG_ADDR_SIZE-1:0][NR_ENTRIES:0] fpr_clobber_vld;   // FPR 被覆蓋的記錄
+ariane_pkg::fu_t [                    NR_ENTRIES:0]               clobber_fu;        // 每條 ROB 條目的 fu 記錄
+
+always_comb begin : clobber_assign
+  gpr_clobber_vld = '0;
+  fpr_clobber_vld = '0;
+
+  clobber_fu[NR_ENTRIES] = ariane_pkg::NONE;
+  for (int unsigned i = 0; i < 2 ** ariane_pkg::REG_ADDR_SIZE; i++) begin
+    gpr_clobber_vld[i][NR_ENTRIES] = 1'b1;  // 預設最後一個欄位為 valid
+    fpr_clobber_vld[i][NR_ENTRIES] = 1'b1;
+  end
+
+  for (int unsigned i = 0; i < NR_ENTRIES; i++) begin
+    gpr_clobber_vld[mem_q[i].sbe.rd][i] = mem_q[i].issued & ~mem_q[i].is_rd_fpr_flag;
+    fpr_clobber_vld[mem_q[i].sbe.rd][i] = mem_q[i].issued & mem_q[i].is_rd_fpr_flag;
+    clobber_fu[i]                       = mem_q[i].sbe.fu;
+  end
+
+  gpr_clobber_vld[0] = '0;  // x0 永遠不能被 clobber
+end
+
+// 使用 rr_arb_tree 選出最後一個對應的 clobber fu
+for (genvar k = 0; k < 2 ** ariane_pkg::REG_ADDR_SIZE; k++) begin : gen_sel_clobbers
+  rr_arb_tree #( .NumIn(NR_ENTRIES + 1), .DataType(ariane_pkg::fu_t), .ExtPrio(1'b1), .AxiVldRdy(1'b1) ) i_sel_gpr_clobbers (
+    .clk_i(clk_i), .rst_ni(rst_ni), .flush_i(1'b0), .rr_i('0),
+    .req_i(gpr_clobber_vld[k]), .gnt_o(), .data_i(clobber_fu), .gnt_i(1'b1), .req_o(), .data_o(rd_clobber_gpr_o[k]), .idx_o()
+  );
+
+  if (CVA6Cfg.FpPresent) begin
+    rr_arb_tree #( .NumIn(NR_ENTRIES + 1), .DataType(ariane_pkg::fu_t), .ExtPrio(1'b1), .AxiVldRdy(1'b1) ) i_sel_fpr_clobbers (
+      .clk_i(clk_i), .rst_ni(rst_ni), .flush_i(1'b0), .rr_i('0),
+      .req_i(fpr_clobber_vld[k]), .gnt_o(), .data_i(clobber_fu), .gnt_i(1'b1), .req_o(), .data_o(rd_clobber_fpr_o[k]), .idx_o()
+    );
+  end
+end
+
+// ------------------------------------------------------------------------------------------------------
+// Read Operands (a.k.a forwarding)
+// ------------------------------------------------------------------------------------------------------
+// 模擬 register file 的 forwarding 機制：使用 ROB + WB port 中的最新資料填入 operand
+logic [NR_ENTRIES+CVA6Cfg.NrWbPorts-1:0][riscv::XLEN-1:0] rs_data;
+logic [1:0][NR_ENTRIES+CVA6Cfg.NrWbPorts-1:0]             rs1_fwd_req;
+logic [1:0][NR_ENTRIES+CVA6Cfg.NrWbPorts-1:0]             rs2_fwd_req;
+logic [1:0][NR_ENTRIES+CVA6Cfg.NrWbPorts-1:0]             rs3_fwd_req;
+logic [1:0]                                               rs1_valid;
+logic [1:0]                                               rs2_valid;
+logic [1:0]                                               rs3_valid;
+logic [127:0]                                             ob_NrWbPorts;
+assign ob_NrWbPorts = CVA6Cfg.NrWbPorts;
+
+// ------------------------------------------------------------------------------------------------------
+// WB ports have higher prio than entries
+// ------------------------------------------------------------------------------------------------------
+// 來自 WB port 的資料優先權高於 ROB 的值
+for (genvar k = 0; unsigned'(k) < CVA6Cfg.NrWbPorts; k++) begin 
+  assign rs1_fwd_req[0][k] = (mem_q[trans_id_i[k]].sbe.rd == rs1_i[0]) & wt_valid_i[k] & (~ex_i[k].valid) & 
+                             (mem_q[trans_id_i[k]].is_rd_fpr_flag == (CVA6Cfg.FpPresent && ariane_pkg::is_rs1_fpr(issue_instr_o[0].op)));
+  assign rs2_fwd_req[0][k] = (mem_q[trans_id_i[k]].sbe.rd == rs2_i[0]) & wt_valid_i[k] & (~ex_i[k].valid) & 
+                             (mem_q[trans_id_i[k]].is_rd_fpr_flag == (CVA6Cfg.FpPresent && ariane_pkg::is_rs2_fpr(issue_instr_o[0].op)));
+  assign rs3_fwd_req[0][k] = (mem_q[trans_id_i[k]].sbe.rd == rs3_i[0]) & wt_valid_i[k] & (~ex_i[k].valid) & 
+                             (mem_q[trans_id_i[k]].is_rd_fpr_flag == (CVA6Cfg.FpPresent && ariane_pkg::is_imm_fpr(issue_instr_o[0].op)));
+
+  assign rs1_fwd_req[1][k] = (mem_q[trans_id_i[k]].sbe.rd == rs1_i[1]) & wt_valid_i[k] & (~ex_i[k].valid) & 
+                             (mem_q[trans_id_i[k]].is_rd_fpr_flag == (CVA6Cfg.FpPresent && ariane_pkg::is_rs1_fpr(issue_instr_o[1].op)));
+  assign rs2_fwd_req[1][k] = (mem_q[trans_id_i[k]].sbe.rd == rs2_i[1]) & wt_valid_i[k] & (~ex_i[k].valid) & 
+                             (mem_q[trans_id_i[k]].is_rd_fpr_flag == (CVA6Cfg.FpPresent && ariane_pkg::is_rs2_fpr(issue_instr_o[1].op)));
+  assign rs3_fwd_req[1][k] = (mem_q[trans_id_i[k]].sbe.rd == rs3_i[1]) & wt_valid_i[k] & (~ex_i[k].valid) & 
+                             (mem_q[trans_id_i[k]].is_rd_fpr_flag == (CVA6Cfg.FpPresent && ariane_pkg::is_imm_fpr(issue_instr_o[1].op)));
+
+  assign rs_data[k] = wbdata_i[k];
+end
+```
+
+---
+
+### 📘 說明摘要：Register Clobber 檢查與 Operand Forwarding
+
+這段邏輯負責在 `issue_stage` 與 `rob` 模組中實作兩大核心功能：
+
+#### 1. RD Clobber 判斷
+- 每個 register 都可能被多個 ROB 條目寫入（例如：後發先 commit），需追蹤最後一個覆蓋的 FU。
+- 使用 round-robin arbiter (`rr_arb_tree`) 決定哪一條指令是最終覆蓋這個目的暫存器的來源。
+- 根據 GPR/FPR 分別建立 `rd_clobber_gpr_o`、`rd_clobber_fpr_o`。
+
+#### 2. Operand Forwarding
+- 比對 operand 是否可以從 WB port 取得（優先級比 ROB 高），或是從 ROB 中取得結果。
+- 支援 rs1、rs2、rs3 三種來源，並考慮浮點 / 整數不同格式。
+- 有效性條件：register id 相同、發出資料有效 (`wt_valid_i`)、沒有 exception 發生。
+
+---
+
+
