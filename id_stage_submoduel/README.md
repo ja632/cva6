@@ -153,4 +153,67 @@ end
 - 結合 `pointer_freelist` 指標控制分配順序，在雙發射架構下支援兩筆同時更新。
 
 ---
+### 🧠 Freelist - 分支快照邏輯（Branch Snapshot in Freelist）
+
+```systemverilog
+// ------------------------------------------------------------------------------------------------
+// 判斷目前是否發派的是 branch/jalr 指令（需要記錄快照）
+// ------------------------------------------------------------------------------------------------
+assign issue_is_branch[0] = (br_instr_i[0] & issue_instr_valid_i[0] & issue_ack_o[0]);
+assign issue_is_branch[1] = (br_instr_i[1] & issue_instr_valid_i[1] & issue_ack_o[1]);
+
+always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (~rst_ni) begin
+        // Reset 時將所有 branch 快照資料清空
+        for (int unsigned j = 0; j < 16; j++) begin
+            br_snopshot_freelist[j] <= 'd0;
+        end
+    end else begin 
+        // 同時發派兩條 branch 指令（需要記錄兩個快照）
+        if(issue_is_branch[0] & issue_is_branch[1]) begin
+            // 快照 1：紀錄當下的 physical_register_freelist 狀態為 br_push_ptr
+            for (int unsigned j = 0; j < CVA6Cfg.Nrmaptable; j++) begin
+                if(issue_enable[0] & (j==issue_ptr[0])) // 發派新的實體暫存器
+                    br_snopshot_freelist[br_push_ptr][j] <= 1'd1;
+                else if(commit_enable[0] & (j==commit_ptr[0]) || commit_enable[1] & (j==commit_ptr[1])) // 寄存器回收
+                    br_snopshot_freelist[br_push_ptr][j] <= 1'd0;
+                else // 其餘保留原 freelist 狀態
+                    br_snopshot_freelist[br_push_ptr][j] <= physical_register_freelist_q[j];
+            end
+
+            // 快照 2：下一個 br_push_ptr+1 也同樣更新（for 第二條 branch）
+            for (int unsigned j = 0; j < CVA6Cfg.Nrmaptable; j++) begin
+                if(issue_enable[0] & (j==issue_ptr[0]) || issue_enable[1] & (j==issue_ptr[1]))
+                    br_snopshot_freelist[br_push_ptr+4'd1][j] <= 1'd1;
+                else if(commit_enable[0] & (j==commit_ptr[0]) || commit_enable[1] & (j==commit_ptr[1]))
+                    br_snopshot_freelist[br_push_ptr+4'd1][j] <= 1'd0;
+                else
+                    br_snopshot_freelist[br_push_ptr+4'd1][j] <= physical_register_freelist_q[j];
+            end
+        end 
+        // 僅有 issue[0] 是 branch 指令
+        else if(issue_is_branch[0]) begin 
+            for (int unsigned j = 0; j < CVA6Cfg.Nrmaptable; j++) begin
+                if(issue_enable[0] & (j==issue_ptr[0]))
+                    br_snopshot_freelist[br_push_ptr][j] <= 1'd1;
+                else if(commit_enable[0] & (j==commit_ptr[0]) || commit_enable[1] & (j==commit_ptr[1]))
+                    br_snopshot_freelist[br_push_ptr][j] <= 1'd0;
+                else
+                    br_snopshot_freelist[br_push_ptr][j] <= physical_register_freelist_q[j];
+            end
+        end 
+        // 非 branch 發派，仍需寫入最新狀態避免錯過更新（處理 flush/mispredict 時用）
+        else begin 
+            for (int unsigned j = 0; j < CVA6Cfg.Nrmaptable; j++) begin
+                if(issue_enable[0] & (j==issue_ptr[0]) || issue_enable[1] & (j==issue_ptr[1]))
+                    br_snopshot_freelist[br_push_ptr][j] <= 1'd1;
+                else if(commit_enable[0] & (j==commit_ptr[0]) || commit_enable[1] & (j==commit_ptr[1]))
+                    br_snopshot_freelist[br_push_ptr][j] <= 1'd0;
+                else
+                    br_snopshot_freelist[br_push_ptr][j] <= physical_register_freelist_q[j];
+            end
+        end
+    end
+end
+```
 
