@@ -90,3 +90,67 @@ always_comb begin
     end
 end
 ```
+### ♻️ Free List Update 機制
+
+```systemverilog
+// ------------------------------------------------------------------------------------------------
+//  update free list
+// ------------------------------------------------------------------------------------------------
+always_comb begin
+    // 預設將下一狀態設為目前狀態
+    physical_register_freelist_n = physical_register_freelist_q;
+
+    // 若遇到 flush 未發出指令，則從分支快照中還原 freelist 狀態
+    if(flush_unissied_instr_i) begin
+        for (int unsigned j = 0; j < CVA6Cfg.Nrmaptable; j++) begin
+            if(physical_register_freelist_n[j]!=1'd0) begin 
+                physical_register_freelist_n[j] = br_snopshot_freelist[br_pop_ptr][j];
+            end
+        end
+    end
+
+    // 新發出的指令要分配 register，將對應 index 設為 1（代表已分配）
+    if(issue_enable[0]) begin
+        physical_register_freelist_n[issue_ptr[0]] = 1'd1;
+    end 
+    if(issue_enable[1]) begin
+        physical_register_freelist_n[issue_ptr[1]] = 1'd1;
+    end 
+
+    // commit 階段的指令釋放 register，設為 0（代表可用）
+    if(commit_enable[0]) begin 
+        physical_register_freelist_n[commit_ptr[0]] = 1'd0;
+    end
+    if(commit_enable[1]) begin 
+        physical_register_freelist_n[commit_ptr[1]] = 1'd0;
+    end
+end
+
+// ------------------------------------------------------------------------------------------------
+// 以暫存器的方式記住 freelist 狀態（同步更新）
+// ------------------------------------------------------------------------------------------------
+always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (~rst_ni) 
+    begin
+        // Reset 時，freelist 初始化（只有 x0 無效）
+        physical_register_freelist_q <= 'd1;
+    end 
+    else if(flush_i) begin
+        // flush 時也將 freelist 重設（例：發生 exception）
+        physical_register_freelist_q <= 'd1;
+    end
+    else begin
+        // 正常情況下將下一狀態覆蓋
+        physical_register_freelist_q <= physical_register_freelist_n;
+    end
+end
+```
+
+🔍 **說明摘要：**
+- `physical_register_freelist_q` 是一個 bitmap，每個 bit 代表對應實體暫存器是否為空（0=可用，1=已分配）。
+- `flush_unissied_instr_i` 會觸發從分支快照記憶體中還原 freelist 狀態。
+- 新指令 rename 時會登記為 "已分配"，commit 時會釋放為 "可用"。
+- 結合 `pointer_freelist` 指標控制分配順序，在雙發射架構下支援兩筆同時更新。
+
+---
+
