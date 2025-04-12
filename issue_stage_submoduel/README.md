@@ -528,3 +528,144 @@ end
 3. **Commit 動作處理**：當指令成功寫回時，從 ROB 清除該條目，若為分支指令則記錄其資訊以供 flush 使用。
 
 這部分確保 ROB 條目的更新與釋放符合 CPU 動態指令執行模型，對維持指令準確性和支援分支回溯至關重要。
+
+---
+
+
+### 🧠 ROB Flush 與 FIFO Counter 更新邏輯詳細解析
+
+```systemverilog
+// ------------------------------------------------------------------------------------------------
+// 🚨 Flush 機制：處理 Branch Mispredict 對 ROB 的影響
+// ------------------------------------------------------------------------------------------------
+
+// 確認是否需要觸發 flush_instr：
+// 條件：有 mispredict 發生，且 flush_pointer (trans_id) 指向的指令是 active、尚未 commit。
+if (resolved_branch_i.is_mispredict & 
+    (commit_pointer_q[0] != flush_branch_mispredict_plus) & 
+    (issue_pointer_q  != flush_branch_mispredict_plus) & 
+    mem_n[flush_branch_mispredict_plus].issued) 
+begin 
+  flush_instr = 1'd1;
+end
+
+// 主體分支：根據不同 case_flush 情況進行 flush
+if (resolved_branch_i.is_mispredict) begin
+
+  // Case: ROB 是環狀（issue_pointer_q 小於 flush_branch）
+  if (case_flush) begin 
+    if (flush_branch_mispredict > issue_pointer_q) begin 
+      for (int i = 0; i < NR_ENTRIES; i++) begin 
+        if ((i > flush_branch_mispredict || i < issue_pointer_q) && mem_n[i].issued) begin 
+          mem_n[i].sbe.valid      = 1'b0;
+          mem_n[i].issued         = 1'b0;
+          flush_entry_n[i]        = 1'b1;
+          flush_fu_n[i]           = mem_n[i].sbe.fu;
+          flush_trans_id_n[i]     = i;
+          flush_lsu_addr_n[i]     = mem_n[i].sbe.lsu_addr;
+        end
+      end
+    end else begin
+      for (int i = 0; i < NR_ENTRIES; i++) begin 
+        if ((i > flush_branch_mispredict && i < issue_pointer_q) && mem_n[i].issued) begin 
+          mem_n[i].sbe.valid      = 1'b0;
+          mem_n[i].issued         = 1'b0;
+          flush_entry_n[i]        = 1'b1;
+          flush_fu_n[i]           = mem_n[i].sbe.fu;
+          flush_trans_id_n[i]     = i;
+          flush_lsu_addr_n[i]     = mem_n[i].sbe.lsu_addr;
+        end
+      end
+    end    
+  end else begin 
+    for (int i = 0; i < NR_ENTRIES; i++) begin 
+      if ((i > flush_branch_mispredict && i < issue_pointer_q) && mem_n[i].issued) begin 
+        mem_n[i].sbe.valid      = 1'b0;
+        mem_n[i].issued         = 1'b0;
+        flush_entry_n[i]        = 1'b1;
+        flush_fu_n[i]           = mem_n[i].sbe.fu;
+        flush_trans_id_n[i]     = i;
+        flush_lsu_addr_n[i]     = mem_n[i].sbe.lsu_addr;
+      end
+    end
+  end
+
+  // Edge case：flush_branch_mispredict == issue_pointer_q == commit_pointer_q[0]
+  if ((flush_branch_mispredict == issue_pointer_q) && 
+      (flush_branch_mispredict == commit_pointer_q[0])) begin 
+    for (int i = 0; i < NR_ENTRIES; i++) begin 
+      if (mem_n[i].issued && (i != flush_branch_mispredict)) begin 
+        mem_n[i].sbe.valid      = 1'b0;
+        mem_n[i].issued         = 1'b0;
+        flush_entry_n[i]        = 1'b1;
+        flush_fu_n[i]           = mem_n[i].sbe.fu;
+        flush_trans_id_n[i]     = i;
+        flush_lsu_addr_n[i]     = mem_n[i].sbe.lsu_addr;
+      end
+    end
+  end
+end
+
+// ------------------------------------------------------------------------------------------------
+// 🔄 全面 Flush（例如 CSR exception, trap）時清空所有 ROB 條目
+// ------------------------------------------------------------------------------------------------
+if (flush_i) begin
+  for (int unsigned i = 0; i < NR_ENTRIES; i++) begin
+    mem_n[i].issued       = 1'b0;
+    mem_n[i].sbe.valid    = 1'b0;
+    mem_n[i].sbe.ex.valid = 1'b0;
+  end
+end
+
+// ------------------------------------------------------------------------------------------------
+// 📊 FIFO Counter 更新邏輯：ROB 管理指標更新
+// ------------------------------------------------------------------------------------------------
+
+// commit slot 可處理雙發（dual commit）或單發
+if (CVA6Cfg.NrCommitPorts == 2) begin : gen_commit_ports
+  assign num_commit = commit_ack_i[1] + commit_ack_i[0] + {1'd0, num_flush_q};
+end else begin : gen_one_commit_port
+  assign num_commit = commit_ack_i[0];
+end
+
+// 更新 issue/commit counter
+assign issue_cnt_n = (flush_i) ? '0 : issue_cnt_q 
+                              - {{BITS_ENTRIES-$clog2(CVA6Cfg.NrCommitPorts){1'b0}}, num_commit}
+                              + {{BITS_ENTRIES-1{1'b0}}, issue_en_0}
+                              + {{BITS_ENTRIES-1{1'b0}}, issue_en_1};
+
+assign commit_pointer_n[0] = (flush_i) ? '0 : commit_pointer_q[0] + num_commit;
+assign issue_pointer_n     = (flush_i) ? '0 : issue_pointer_q + issue_en_0 + issue_en_1;
+
+// 如果有多個 commit port，事先計算對應 commit_pointer_n 的偏移量
+for (genvar k = 1; k < CVA6Cfg.NrCommitPorts; k++) begin : gen_cnt_incr
+  assign commit_pointer_n[k] = (flush_i) ? '0 : commit_pointer_n[0] + unsigned'(k);
+end
+```
+
+---
+
+### 📘 說明摘要：Branch Mispredict 的 Flush 管理
+
+這一段處理的是 **ROB 在 branch misprediction 時的清除與更新行為**，功能與細節如下：
+
+1. **Flush 判定條件**：
+   - 需要偵測是否有發生 mispredict，而且必須跳過正在 commit 的指令。
+   - 判定條件考慮 `issue_pointer_q`, `commit_pointer_q`, `flush_branch_mispredict_plus` 三者。
+
+2. **Flush 內容**：
+   - 根據是否跨越環狀 ROB 頭尾（case_flush），計算出需要清除的區間。
+   - 清除後會清空該 ROB 條目的 issued 和 valid 狀態，並額外記錄 flush 資訊如功能單元、trans_id 和 LSU 地址。
+
+3. **Flush 例外狀況處理**：
+   - 若 branch 的位置與 `issue_pointer_q` 和 `commit_pointer_q[0]` 都相同，則僅保留該條指令，其餘全部清除。
+
+4. **完整 Flush (flush_i)**：
+   - 例如 exception 或 trap 會導致整個 ROB 清空。
+
+5. **FIFO Counter 更新邏輯**：
+   - 根據 flush、commit 與 issue 行為更新 ROB 內的 issue/commit pointer 和佇列長度。
+
+此段為 ROB 設計中處理 control flow 錯誤（如 branch prediction fail）最核心的一部分。
+---
+
