@@ -603,3 +603,72 @@ end
 | 發派一條分支指令 | 建立一個 snapshot，對應 `br_push_ptr`                                |
 | 非分支發派       | 預先記錄 snapshot，供 mispredict 後還原使用                         |
 | Reset/Flush      | 快照資料歸零、busytable 狀態清除                                    |
+
+### 🧩 `maptable` 模組介面註解與功能說明
+
+```systemverilog
+module maptable import ariane_pkg::*; #(
+    parameter config_pkg::cva6_cfg_t CVA6Cfg = config_pkg::cva6_cfg_empty
+) (
+    // 🕒 時脈與重置
+    input  logic clk_i,                             // 系統時鐘
+    input  logic rst_ni,                            // 非同步 reset（低有效）
+
+    // 🧹 Flush 控制
+    input  logic flush_i,                           // flush 整體 map table 狀態（分支錯誤等情況）
+    input  logic flush_unissied_instr_i,            // flush 未發派的指令
+
+    // 🎯 發派 (issue) 相關訊號
+    input  scoreboard_entry_t [CVA6Cfg.NrissuePorts-1:0] issue_instr_i,         // 每個 issue port 對應的 scoreboard 指令內容
+    input  logic              [CVA6Cfg.NrissuePorts-1:0] issue_instr_valid_i,   // 每個 issue port 是否為有效指令
+    input  logic              [CVA6Cfg.NrissuePorts-1:0] issue_ack_o,           // 發派是否成功（handshake）
+    input  logic              [CVA6Cfg.NrissuePorts-1:0] no_rename_i,           // 該指令是否不需要 rename
+
+    // ✅ 寫回 (commit) 相關訊號
+    input  scoreboard_entry_t [CVA6Cfg.NrissuePorts-1:0] commit_instr_o,        // commit 時的指令內容
+    input  logic              [CVA6Cfg.NrissuePorts-1:0] commit_ack_i,          // commit 是否完成
+
+    // 🆕 由 freelist 分配的新實體目的暫存器
+    input  [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-2:0] Pr_rd_o_rob,           // 實體暫存器 index（不含 valid bit）
+
+    // 📝 commit 階段寫回的實體暫存器位址（含 valid bit）
+    input  logic [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-1:0] physical_waddr_i,// 含 valid bit 的實體寫回暫存器位址
+
+    // 📤 查表輸出對應的來源暫存器實體映射結果（不含 valid bit）
+    output logic [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-2:0] Pr_rs1_o,        // rs1 對應的實體暫存器編號
+    output logic [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-2:0] Pr_rs2_o,        // rs2 對應的實體暫存器編號
+    output logic [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-2:0] Pr_rs3_o,        // rs3（浮點 result）對應實體暫存器編號
+
+    // 💾 提供 rename buffer 寫入的虛擬目的暫存器資訊
+    output logic [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-1:0] virtual_waddr_o, // 發派時產出的虛擬 rd
+    output logic [CVA6Cfg.NrissuePorts-1:0] virtual_waddr_valid,               // 虛擬 rd 是否有效
+
+    // 🔁 Commit 階段逆查原虛擬 register 的來源
+    input  [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-1:0] rs1_physical_i,        // 實體 rs1 位置（含 valid bit）
+    input  [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-1:0] rs2_physical_i,        // 實體 rs2 位置（含 valid bit）
+    input  [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-1:0] rs3_physical_i,        // 實體 rs3 位置（含 valid bit）
+    output logic [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-2:0] rs1_virtual_o,   // 回推出對應的虛擬 rs1
+    output logic [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-2:0] rs2_virtual_o,   // 回推出對應的虛擬 rs2
+    output logic [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-2:0] rs3_virtual_o,   // 回推出對應的虛擬 rs3
+
+    // 🧠 分支相關控制（分支快照）
+    input logic [CVA6Cfg.NrissuePorts-1:0] br_instr_i,                          // 每個 port 是否為分支指令（須快照）
+    input logic [CVA6Cfg.NrissuePorts-1:0] commit_no_rename,                   // 該指令在 commit 時是否沒 rename
+
+    // 🪟 分支快照指標
+    input  [3:0] br_push_ptr,                                                  // 快照寫入索引
+    input  [3:0] br_pop_ptr                                                    // 快照回復索引
+);
+```
+
+---
+
+### 📘 小結：MapTable 模組介面功能
+
+| 功能類別     | 說明                                                                 |
+|--------------|----------------------------------------------------------------------|
+| 發派對應     | 根據指令的虛擬 rd 建立新的實體對應                                    |
+| commit 還原  | 在 commit 階段更新實體/虛擬對應，實現 rename 的「釋放」與「復原」       |
+| 快照功能     | 支援分支快照與 rollback，用於恢復 rename 狀態                           |
+| reverse lookup | 提供給外部模組從實體推回原虛擬暫存器，方便 debug/commit 邏輯             |
+
