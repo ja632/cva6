@@ -963,3 +963,124 @@ module issue_read_operands
 這個模組是整個 Out-of-Order pipeline 的一個關鍵，負責在 rename 與 execute 間銜接，處理最複雜的運算元資料通路。
 
 
+---
+
+### 🧠 issue_read_operands: Operand Preparation and FU Issue Logic
+
+```systemverilog
+// =============================================
+// 🧠 issue_read_operands: Operand Preparation and FU Issue Logic
+// =============================================
+
+// ------------------------------------------------------------------------------------------------------
+// ⚙️ FU Operand 準備與發出控制
+// ------------------------------------------------------------------------------------------------------
+
+// 儲存轉發相關資訊與暫存器結果值的暫存變數群
+logic         [CVA6Cfg.NrissuePorts-1:0][TRANS_ID_BITS-1:0]    trans_id_n;          // 每條指令對應的 trans_id (下一狀態)
+logic         [CVA6Cfg.NrissuePorts-1:0][TRANS_ID_BITS-1:0]    trans_id_q;          // 每條指令對應的 trans_id (目前狀態)
+logic         [CVA6Cfg.NrissuePorts-1:0][3:0]                  forward_rs1_fu_n;    // 用於追蹤 rs1 轉發來源 FU
+logic         [CVA6Cfg.NrissuePorts-1:0][3:0]                  forward_rs2_fu_n;    // 用於追蹤 rs2 轉發來源 FU
+
+// Operand 相關暫存器（regfile 或轉發來源）
+riscv::xlen_t [CVA6Cfg.NrissuePorts-1:0] operand_a_regfile;     // rs1 from regfile
+riscv::xlen_t [CVA6Cfg.NrissuePorts-1:0] operand_b_regfile;     // rs2 from regfile
+riscv::xlen_t [CVA6Cfg.NrissuePorts-1:0] operand_a_n;           // rs1 本週期輸入（下一狀態）
+riscv::xlen_t [CVA6Cfg.NrissuePorts-1:0] operand_a_q;           // rs1 儲存值（目前狀態）
+riscv::xlen_t [CVA6Cfg.NrissuePorts-1:0] operand_b_n;           // rs2 本週期輸入
+riscv::xlen_t [CVA6Cfg.NrissuePorts-1:0] operand_b_q;           // rs2 儲存值
+riscv::xlen_t [CVA6Cfg.NrissuePorts-1:0] imm_forward_rs3;       // 立即數轉發（例如 rs3 寫 immediate）
+riscv::xlen_t [CVA6Cfg.NrissuePorts-1:0] imm_q;                 // 立即數儲存值
+riscv::xlen_t [CVA6Cfg.NrissuePorts-1:0] imm_n;                 // 立即數輸入值
+
+// rs3 operands 的來源（針對 FMA 或三操作數）
+rs3_len_t     [CVA6Cfg.NrissuePorts-1:0] operand_c_regfile;     // rs3 from regfile
+rs3_len_t     [CVA6Cfg.NrissuePorts-1:0] operand_c_fpr;         // rs3 from FPR
+rs3_len_t     [CVA6Cfg.NrissuePorts-1:0] operand_c_gpr;         // rs3 from GPR
+
+// stall 訊號判定
+logic [CVA6Cfg.NrissuePorts-1:0] stall_rs1;    // rs1 無 ready
+logic [CVA6Cfg.NrissuePorts-1:0] stall_rs2;    // rs2 無 ready
+logic [CVA6Cfg.NrissuePorts-1:0] stall_csr;    // CSR busy 時 stall
+logic [CVA6Cfg.NrissuePorts-1:0] fu_busy;      // FU 是否可用判斷
+
+// forwarding flags：operand 來自 forwarding 而非 regfile
+logic [CVA6Cfg.NrissuePorts-1:0] forward_rs1;
+logic [CVA6Cfg.NrissuePorts-1:0] forward_rs2;
+logic [CVA6Cfg.NrissuePorts-1:0] forward_rs3;
+
+// 指令對應的運算元與功能單元類型
+fu_op [CVA6Cfg.NrissuePorts-1:0] operator_n;  // 本週期運算類型
+fu_op [CVA6Cfg.NrissuePorts-1:0] operator_q;  // 儲存的運算類型
+fu_t  [CVA6Cfg.NrissuePorts-1:0] fu_n;        // 功能單元類型
+fu_t  [CVA6Cfg.NrissuePorts-1:0] fu_q;        // 功能單元類型暫存
+
+// 是否可進入 EX 的條件（會套用 valid + ack）
+logic [CVA6Cfg.NrissuePorts-1:0] issue_to_ex;
+
+// 各功能單元輸出 valid 狀態暫存（給下一級）
+logic alu0_valid_q, alu1_valid_q, mult0_valid_q, mult1_valid_q;
+logic fpu_valid_q, lsu_valid_q, csr_valid_q, branch_valid_q, cvxif_valid_q;
+logic [1:0] fpu_fmt_q;
+logic [2:0] fpu_rm_q;
+logic [31:0] cvxif_off_instr_q;
+
+// Issue ack 給 ROB 使用
+logic issue_ack_0, issue_ack_1;
+
+riscv::instruction_t orig_instr;
+
+// ---------------------------------------------
+// 📤 Forwarding Unregistered Operands 給外部模組
+// ---------------------------------------------
+assign rs1_forwarding_o[0] = operand_a_n[0][riscv::VLEN-1:0];
+assign rs2_forwarding_o[0] = operand_b_n[0][riscv::VLEN-1:0];
+assign rs1_forwarding_o[1] = operand_a_n[1][riscv::VLEN-1:0];
+assign rs2_forwarding_o[1] = operand_b_n[1][riscv::VLEN-1:0];
+
+// ---------------------------------------------
+// 📦 FU Data Output 封裝（送往 EX）
+// ---------------------------------------------
+assign fu_data_o[0].operand_a = operand_a_q[0];
+assign fu_data_o[0].operand_b = operand_b_q[0];
+assign fu_data_o[0].fu        = fu_q       [0];
+assign fu_data_o[0].operation = operator_q [0];
+assign fu_data_o[0].trans_id  = trans_id_q [0];
+assign fu_data_o[0].imm       = imm_q      [0];
+
+assign fu_data_o[1].operand_a = operand_a_q[1];
+assign fu_data_o[1].operand_b = operand_b_q[1];
+assign fu_data_o[1].fu        = fu_q       [1];
+assign fu_data_o[1].operation = operator_q [1];
+assign fu_data_o[1].trans_id  = trans_id_q [1];
+assign fu_data_o[1].imm       = imm_q      [1];
+
+// ---------------------------------------------
+// ✅ FU Valid 訊號輸出
+// ---------------------------------------------
+assign alu0_valid_o      = alu0_valid_q;
+assign alu1_valid_o      = alu1_valid_q;
+assign branch_valid_o    = branch_valid_q;
+assign lsu_valid_o       = lsu_valid_q;
+assign csr_valid_o       = csr_valid_q;
+assign mult0_valid_o     = mult0_valid_q;
+assign mult1_valid_o     = mult1_valid_q;
+assign fpu_valid_o       = fpu_valid_q;
+assign fpu_fmt_o         = fpu_fmt_q;
+assign fpu_rm_o          = fpu_rm_q;
+assign cvxif_valid_o     = CVA6Cfg.CvxifEn ? cvxif_valid_q : '0;
+assign cvxif_off_instr_o = CVA6Cfg.CvxifEn ? cvxif_off_instr_q : '0;
+
+// ---------------------------------------------
+// ⛔️ Stall 判斷（CSR stall 會停止 issue）
+// ---------------------------------------------
+assign stall_issue_o     = (|stall_csr);
+
+// ---------------------------------------------
+// 🔄 判斷此指令是否可送入 EX pipeline
+// ---------------------------------------------
+assign issue_to_ex[0] = (!issue_instr_i[0].ex.valid && issue_instr_valid_i[0] && issue_ack_o[0]);
+assign issue_to_ex[1] = (!issue_instr_i[1].ex.valid && issue_instr_valid_i[1] && issue_ack_o[1]);
+```
+
+
