@@ -1209,5 +1209,94 @@ always_comb begin
   rs3_o[1] = issue_instr_i[1].result[REG_ADDR_SIZE-1:0];
 end
 ```
+---
+### Source Register Forwarding & CSR Hazard Detection
+
+```systemverilog
+// =============================================
+// 🧮 Source Register Forwarding & CSR Hazard Detection
+// =============================================
+
+// --------------------------------------------------------------------------------------------------------------------------------------------
+// 0. 檢查是否使用 zimm (zero immediate) 作為 rs1：如果是，表示不是 register operand，不需要做 forward/stall 判斷
+// 1. 根據 GPR/FPR clobber list 檢查 rs1 是否已被尚未完成的 instruction 覆蓋
+// 2. 若 rs1 已被 CSR 指令覆蓋，則無法 forward，只能從 register file 取，需等待 commit，因而 stall
+// 3. 若可以 forward，則啟用 forward_rs1 標記；否則設定要 forward 的來源 fu，並 stall
+// --------------------------------------------------------------------------------------------------------------------------------------------
+
+if (!issue_instr_i[0].use_zimm && (((CVA6Cfg.FpPresent && is_rs1_fpr(issue_instr_i[0].op)) ?
+    rd_clobber_fpr_i[issue_instr_i[0].rs1] != NONE : rd_clobber_gpr_i[issue_instr_i[0].rs1] != NONE))) begin
+
+  if (rs1_valid_i[0] && (CVA6Cfg.FpPresent && is_rs1_fpr(issue_instr_i[0].op) ?
+     1'b1 : ((rd_clobber_gpr_i[issue_instr_i[0].rs1] != CSR) || (CVA6Cfg.RVS && issue_instr_i[0].op == SFENCE_VMA)))) begin
+    forward_rs1[0] = 1'b1;
+  end else if ((rd_clobber_gpr_i[issue_instr_i[0].rs1] == CSR)) begin 
+    stall_csr[0] = 1'b1;
+  end  else begin  
+    forward_rs1_fu_n[0] = (CVA6Cfg.FpPresent && is_rs1_fpr(issue_instr_i[0].op)) ? rd_clobber_fpr_i[issue_instr_i[0].rs1] : rd_clobber_gpr_i[issue_instr_i[0].rs1];
+    stall_rs1[0] = 1'b1;
+  end
+end
+
+// --------------------------------------------------------------------------------------------------------------------------------------------
+// 第二條指令需額外考慮：其 rs1 是否與第一條指令 rd 相同？若相同代表 bypass，來源為 port0 的指令
+// --------------------------------------------------------------------------------------------------------------------------------------------
+
+if (!issue_instr_i[1].use_zimm && (((CVA6Cfg.FpPresent && is_rs1_fpr(issue_instr_i[1].op)) ?
+   rd_clobber_fpr_i[issue_instr_i[1].rs1] != NONE : rd_clobber_gpr_i[issue_instr_i[1].rs1] != NONE) |
+   ((issue_instr_i[1].rs1 == issue_instr_i[0].rd) & (issue_instr_i[0].rd!='0)))) begin
+
+  if (rs1_valid_i[1] && (CVA6Cfg.FpPresent && is_rs1_fpr(issue_instr_i[1].op) ?
+     1'b1 : ((rd_clobber_gpr_i[issue_instr_i[1].rs1] != CSR) || (CVA6Cfg.RVS && issue_instr_i[1].op == SFENCE_VMA)))) begin
+    forward_rs1[1] = 1'b1;
+  end else if ((rd_clobber_gpr_i[issue_instr_i[1].rs1] == CSR) | ((issue_instr_i[0].fu == CSR) & (issue_instr_i[1].rs1==issue_instr_i[0].rd))) begin 
+    stall_csr[1] = 1'b1;
+  end else begin  
+    if((issue_instr_i[1].rs1 == issue_instr_i[0].rd) & (issue_instr_i[0].rd!='0)) begin 
+      forward_rs1_fu_n[1] = issue_instr_i[0].fu;
+    end else begin 
+      forward_rs1_fu_n[1] = (CVA6Cfg.FpPresent && is_rs1_fpr(issue_instr_i[1].op)) ? rd_clobber_fpr_i[issue_instr_i[1].rs1] : rd_clobber_gpr_i[issue_instr_i[1].rs1];
+    end
+    stall_rs1[1] = 1'b1;
+  end
+end
+
+// --------------------------------------------------------------------------------------------------------------------------------------------
+// 檢查 rs2 的 forward 或 stall 條件，基本與 rs1 相同
+// CSR 來源一樣不允許 forward
+// 除此之外若尚未 ready 則也需 stall
+// --------------------------------------------------------------------------------------------------------------------------------------------
+
+if ((((CVA6Cfg.FpPresent && is_rs2_fpr(issue_instr_i[0].op)) ? rd_clobber_fpr_i[issue_instr_i[0].rs2] != NONE : rd_clobber_gpr_i[issue_instr_i[0].rs2] != NONE) & !(issue_instr_i[0].fu==4'd6))) begin
+
+  if (rs2_valid_i[0] && (CVA6Cfg.FpPresent && is_rs2_fpr(issue_instr_i[0].op) ?
+     1'b1 : ((rd_clobber_gpr_i[issue_instr_i[0].rs2] != CSR) || (CVA6Cfg.RVS && issue_instr_i[0].op == SFENCE_VMA)))) begin
+    forward_rs2[0] = 1'b1;
+  end else if (rd_clobber_gpr_i[issue_instr_i[0].rs2] == CSR) begin
+    stall_csr[0] = 1'b1;
+  end else begin  
+    forward_rs2_fu_n[0] = (CVA6Cfg.FpPresent && is_rs2_fpr(issue_instr_i[0].op)) ? rd_clobber_fpr_i[issue_instr_i[0].rs2] : rd_clobber_gpr_i[issue_instr_i[0].rs2];
+    stall_rs2[0] = 1'b1;
+  end
+end
+
+if ((((CVA6Cfg.FpPresent && is_rs2_fpr(issue_instr_i[1].op)) ? rd_clobber_fpr_i[issue_instr_i[1].rs2] != NONE :rd_clobber_gpr_i[issue_instr_i[1].rs2] != NONE) | 
+    ((issue_instr_i[1].rs2 == issue_instr_i[0].rd & (issue_instr_i[0].rd!='0)))) & !(issue_instr_i[1].fu==4'd6)) begin
+
+  if (rs2_valid_i[1] && (CVA6Cfg.FpPresent && is_rs2_fpr(issue_instr_i[1].op) ?
+     1'b1 : ((rd_clobber_gpr_i[issue_instr_i[1].rs2] != CSR) || (CVA6Cfg.RVS && issue_instr_i[1].op == SFENCE_VMA)))) begin
+    forward_rs2[1] = 1'b1;
+  end else if ((rd_clobber_gpr_i[issue_instr_i[1].rs2] == CSR) | ((issue_instr_i[0].fu == CSR) & (issue_instr_i[1].rs2==issue_instr_i[0].rd))) begin 
+    stall_csr[1] = 1'b1;
+  end else begin 
+    if((issue_instr_i[1].rs2 == issue_instr_i[0].rd & (issue_instr_i[0].rd!='0))) begin 
+      forward_rs2_fu_n[1] = issue_instr_i[0].fu;
+    end else begin 
+      forward_rs2_fu_n[1] = (CVA6Cfg.FpPresent && is_rs2_fpr(issue_instr_i[1].op)) ? rd_clobber_fpr_i[issue_instr_i[1].rs2] : rd_clobber_gpr_i[issue_instr_i[1].rs2];
+    end
+    stall_rs2[1] = 1'b1;
+  end
+end
+```
 
 
