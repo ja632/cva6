@@ -667,5 +667,6 @@ end
    - 根據 flush、commit 與 issue 行為更新 ROB 內的 issue/commit pointer 和佇列長度。
 
 此段為 ROB 設計中處理 control flow 錯誤（如 branch prediction fail）最核心的一部分。
+
 ---
 
