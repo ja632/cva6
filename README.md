@@ -989,4 +989,131 @@ assign issue_instr_hs_o = issue_instr_valid_sb_iro & issue_ack_iro_sb;  // 握�
 | rd_clobber* | SB → IRO       | 標記尚未寫回的實體暫存器所屬 FU                        |
 | *_forwarding_o | IRO → FU     | operand forwarding 給下游 Functional Unit 使用        |
 
+---
+
+### 🚀 Issue Stage - 指令管理與運算元準備模組
+
+```systemverilog
+// ----------------------------------------------------------------------------------------------
+// 1. Manage instructions in a rob
+// ----------------------------------------------------------------------------------------------
+rob #(  // ROB: Reorder Buffer 負責儲存並管理尚未完成的指令
+  .CVA6Cfg                ( CVA6Cfg              ),
+  .IsRVFI                 ( IsRVFI               ),
+  .rs3_len_t              ( rs3_len_t            ),  // 第三 source operand 型別（依是否支援 FPR）
+  .NR_ENTRIES             ( NR_ENTRIES           )   // ROB 大小
+) i_rob (
+  .sb_full_o              ( sb_full_o            ),  // 指示 ROB 是否滿了
+  .unresolved_branch_i    ( 1'b0                 ),  // 固定設為 0（分支處理已外部解決）
+  // 各類 forwarding/mapping 與 operand 資訊
+  .rd_clobber_gpr_o       ( rd_clobber_gpr_sb_iro ),
+  .rd_clobber_fpr_o       ( rd_clobber_fpr_sb_iro ),
+  .rs1_i                  ( rs1_iro_sb             ),
+  .rs1_o                  ( rs1_sb_iro             ),
+  .rs1_valid_o            ( rs1_valid_sb_iro       ),
+  .rs2_i                  ( rs2_iro_sb             ),
+  .rs2_o                  ( rs2_sb_iro             ),
+  .rs2_valid_o            ( rs2_valid_iro_sb       ),
+  .rs3_i                  ( rs3_iro_sb             ),
+  .rs3_o                  ( rs3_sb_iro             ),
+  .rs3_valid_o            ( rs3_valid_iro_sb       ),
+  // 發派進入 ROB 的 rename 指令
+  .decoded_instr_i        ( rename_instr_i         ),
+  .decoded_instr_valid_i  ( rename_instr_valid_i   ),
+  .decoded_instr_ack_o    ( rename_instr_ack_o     ),
+  // 從 ROB 發出的待發派指令
+  .issue_instr_o          ( issue_instr_sb_iro     ),
+  .issue_instr_valid_o    ( issue_instr_valid_sb_iro ),
+  .issue_ack_i            ( issue_ack_iro_sb       ),
+  // 寫回與例外處理的資訊
+  .resolved_branch_i      ( resolved_branch_i      ),
+  .trans_id_i             ( trans_id_i             ),
+  .wbdata_i               ( wbdata_i               ),
+  .ex_i                   ( ex_ex_i                ),
+  // LSU 與 forwarding 控制
+  .lsu_addr_i             ( lsu_addr_i             ),
+  .lsu_rmask_i            ( lsu_rmask_i            ),
+  .lsu_wmask_i            ( lsu_wmask_i            ),
+  .lsu_addr_trans_id_i    ( lsu_addr_trans_id_i    ),
+  .rs1_forwarding_i       ( rs1_forwarding_xlen    ),
+  .rs2_forwarding_i       ( rs2_forwarding_xlen    ),
+  // flush control
+  .flush_entry            ( flush_entry            ),
+  .flush_fu               ( flush_fu               ),
+  .flush_trans_id         ( flush_trans_id         ),
+  .flush_lsu_addr         ( flush_lsu_addr         ),
+  .*
+);
+
+// ----------------------------------------------------------------------------------------------
+// 2. Issue instruction and read operand, also commit
+// ----------------------------------------------------------------------------------------------
+issue_read_operands #(  // 功能模組：發派與讀 operand，送往各功能單元
+  .CVA6Cfg                ( CVA6Cfg              ),
+  .rs3_len_t              ( rs3_len_t            )
+) i_issue_read_operands (
+  .flush_i                ( flush_unissued_instr_i ), // 若分支錯誤，flush 尚未發派的指令
+  // 發派階段（從 ROB）
+  .issue_instr_i          ( issue_instr_sb_iro     ),
+  .issue_instr_valid_i    ( issue_instr_valid_sb_iro ),
+  .issue_ack_o            ( issue_ack_iro_sb       ),
+  // 傳送至功能單元的資訊
+  .fu_data_o              ( fu_data_o              ),
+  .alu0_ready_i           ( alu0_ready_i           ),
+  .alu1_ready_i           ( alu1_ready_i           ),
+  .bu_ready_i             ( bu_ready_i             ),
+  .csr_ready_i            ( csr_ready_i            ),
+  .mult0_ready_i          ( mult0_ready_i          ),
+  .mult1_ready_i          ( mult1_ready_i          ),
+  // 實體 operand 資訊與 valid 狀態（rs1/rs2/rs3）
+  .rs1_o                  ( rs1_iro_sb             ),
+  .rs1_i                  ( rs1_sb_iro             ),
+  .rs1_valid_i            ( rs1_valid_sb_iro       ),
+  .rs2_o                  ( rs2_iro_sb             ),
+  .rs2_i                  ( rs2_sb_iro             ),
+  .rs2_valid_i            ( rs2_valid_iro_sb       ),
+  .rs3_o                  ( rs3_iro_sb             ),
+  .rs3_i                  ( rs3_sb_iro             ),
+  .rs3_valid_i            ( rs3_valid_iro_sb       ),
+  // 判斷是否 clobber 某些暫存器的 FU 資訊（avoid hazard）
+  .rd_clobber_gpr_i       ( rd_clobber_gpr_sb_iro  ),
+  .rd_clobber_fpr_i       ( rd_clobber_fpr_sb_iro  ),
+  // 功能單元 valid 輸出（用於實際發派）
+  .alu0_valid_o           ( alu0_valid_o           ),
+  .alu1_valid_o           ( alu1_valid_o           ),
+  .branch_valid_o         ( branch_valid_o         ),
+  .csr_valid_o            ( csr_valid_o            ),
+  // CVXIF 相關訊號
+  .cvxif_valid_o          ( x_issue_valid_o        ),
+  .cvxif_ready_i          ( x_issue_ready_i        ),
+  .cvxif_off_instr_o      ( x_off_instr_o          ),
+  .mult0_valid_o          ( mult0_valid_o          ),
+  .mult1_valid_o          ( mult1_valid_o          ),
+  // forwarding 資料輸出
+  .rs1_forwarding_o       ( rs1_forwarding_xlen    ),
+  .rs2_forwarding_o       ( rs2_forwarding_xlen    ),
+  // 偵測是否 stalled（e.g. 功能單元繁忙）
+  .stall_issue_o          ( stall_issue_o          ),
+  // 建立 operand 映射表與實體對應資訊
+  .rs1_physical_o         ( rs1_physical           ),
+  .rs2_physical_o         ( rs2_physical           ),
+  .rs3_physical_o         ( rs3_physical           ),
+  .rs1_physical_i         ( rs1_virtual            ),
+  .rs2_physical_i         ( rs2_virtual            ),
+  .rs3_physical_i         ( rs3_virtual            ),
+  .virtual_waddr_i        ( virtual_waddr_i        ),
+  .physical_waddr_i       ( physical_waddr_i       ),
+  .waddr_final            ( waddr_final            ),
+  .*
+);
+```
+
+---
+
+### 📘 小結：Issue Stage 中 ROB 與發派模組
+
+| 模組               | 功能描述                                                                 |
+|--------------------|--------------------------------------------------------------------------|
+| `rob`              | 管理發派、等待與寫回，追蹤寄存器使用狀態，支援 forwarding 與 exception 處理 |
+| `issue_read_operands` | 根據 FU 狀態與 operand 資訊判斷是否可發派指令，並傳送給對應的執行單元          |
 
