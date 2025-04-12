@@ -179,3 +179,138 @@ assign flush_branch_mispredict_plus = (trans_id_i[6]==4'd15) ? 3'd0 : (trans_id_
 ariane_pkg::scoreboard_entry_t [1:0] decoded_instr;  // 暫存 port 0 與 port 1 的指令
 
 ```
+
+```systemverilog
+// ------------------------------------------------------------------------------------------------
+// 🧠 ROB Instruction Preparation and RVFI Hookup
+// ------------------------------------------------------------------------------------------------
+// 將 decode 階段傳來的 scoreboard_entry 儲存進 ROB buffer，若啟用 RVFI 模式會補充 rs1/rs2 的數值資料
+// 以及將 LSU 欄位預設清空，確保後續 RVFI trace 資訊正確。
+always_comb begin
+    decoded_instr[0] = decoded_instr_i[0];
+    decoded_instr[1] = decoded_instr_i[1];
+
+    // 如果啟用 RVFI 模式，會將讀取資料與 LSU 資訊初始化
+    if (IsRVFI) begin
+        decoded_instr[0].rs1_rdata = rs1_forwarding_i[0];
+        decoded_instr[0].rs2_rdata = rs2_forwarding_i[0];
+        decoded_instr[0].lsu_addr  = '0;
+        decoded_instr[0].lsu_rmask = '0;
+        decoded_instr[0].lsu_wmask = '0;
+        decoded_instr[0].lsu_wdata = '0;
+
+        decoded_instr[1].rs1_rdata = rs1_forwarding_i[1];
+        decoded_instr[1].rs2_rdata = rs2_forwarding_i[1];
+        decoded_instr[1].lsu_addr  = '0;
+        decoded_instr[1].lsu_rmask = '0;
+        decoded_instr[1].lsu_wmask = '0;
+        decoded_instr[1].lsu_wdata = '0;
+    end
+end
+
+// ------------------------------------------------------------------------------------------------
+// ✅ Commit Ports: 將要寫回的指令從 ROB 中讀出對應位置內容
+// ------------------------------------------------------------------------------------------------
+// 根據 commit_pointer_q 決定從 mem_q 中讀出哪條已完成的指令，
+// 並補上 trans_id，輸出給 commit 單元
+always_comb begin : commit_ports
+    for (int unsigned i = 0; i < CVA6Cfg.NrCommitPorts; i++) begin
+        commit_instr_o[i] = mem_q[commit_pointer_q[i]].sbe;
+        commit_instr_o[i].trans_id = commit_pointer_q[i];
+    end
+end
+
+// ------------------------------------------------------------------------------------------------
+// 🔁 Flush Entry 決策邏輯（標示 flush 條目數量）
+// ------------------------------------------------------------------------------------------------
+// 判斷目前 commit 的條目是否包含被標記為 mispredict 的分支，若是則回傳應該 flush 幾條指令。
+always_comb begin
+    num_flush_q = 4'd0;
+
+    if ((|commit_branch_instr) & (num_flush_flag[commit_pointer_q[0]] | num_flush_flag[commit_pointer_q[1]])) begin
+        if (num_flush_flag[commit_pointer_q[0]])
+            num_flush_q = num_flush_branch[commit_pointer_q[0]];
+
+        if (num_flush_flag[commit_pointer_q[1]])
+            num_flush_q = num_flush_branch[commit_pointer_q[1]];
+    end
+end
+
+// ------------------------------------------------------------------------------------------------
+// 🚩 Flush Flag 與 Flush 數量記錄更新邏輯
+// ------------------------------------------------------------------------------------------------
+// - 若 flush 發生，會記錄是哪一條指令引起，以及需要 flush 幾條。
+// - 若該指令已被 commit，則清除該筆記錄。
+always_comb begin
+    num_flush_flag_n = num_flush_flag;
+    num_flush_branch_n = num_flush_branch;
+
+    if (flush_i) begin
+        num_flush_flag_n = 16'd0;
+        for (int unsigned i = 0; i < NR_ENTRIES; i++) begin
+            num_flush_branch_n[i] = '0;
+        end
+    end else if (resolved_branch_i.is_mispredict & flush_instr) begin
+        // 分支錯誤時設定 flush flag 與對應條數
+        num_flush_flag_n[flush_branch_mispredict] = 1'd1;
+        num_flush_branch_n[flush_branch_mispredict] = flush_number;
+    end
+
+    // 當分支指令寫回後，清除對應 flush flag 記錄
+    if (|commit_branch_instr & !((commit_pointer_q[0] == flush_branch_mispredict) & resolved_branch_i.is_mispredict & flush_instr)) begin
+        num_flush_flag_n[commit_pointer_q[0]] = 1'd0;
+        num_flush_branch_n[commit_pointer_q[0]] = '0;
+    end
+
+    if (|commit_branch_instr & !((commit_pointer_q[1] == flush_branch_mispredict) & resolved_branch_i.is_mispredict & flush_instr)) begin
+        num_flush_flag_n[commit_pointer_q[1]] = 1'd0;
+        num_flush_branch_n[commit_pointer_q[1]] = '0;
+    end
+end
+
+// ------------------------------------------------------------------------------------------------
+// ⏺ Flush 記錄暫存於時脈邊緣
+// ------------------------------------------------------------------------------------------------
+// 在每個時脈邊緣更新 num_flush_flag 與 num_flush_branch，
+// 保持這些 flush 資訊跨 cycle 穩定存在
+always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+        num_flush_flag <= 16'd0;
+        for (int unsigned i = 0; i < NR_ENTRIES; i++) begin
+            num_flush_branch[i] <= '0;
+        end
+    end else begin
+        num_flush_flag <= num_flush_flag_n;
+        for (int unsigned i = 0; i < NR_ENTRIES; i++) begin
+            num_flush_branch[i] <= num_flush_branch_n[i];
+        end
+    end
+end
+
+// ------------------------------------------------------------------------------------------------
+// 📊 Flush Entry 數量計算：計算有幾個條目被標記為 flush
+// ------------------------------------------------------------------------------------------------
+// 統計 flush_entry_n 陣列中有幾個條目需要 flush，回傳 flush_number
+always_comb begin
+    flush_number = '0;
+    for (int unsigned i = 0; i < NR_ENTRIES; i++) begin
+        flush_number = flush_number + flush_entry_n[i];
+    end
+end
+```
+
+---
+
+### 📘 說明摘要
+
+這段程式碼實作的是 Reorder Buffer（ROB）的後半部功能：
+
+1. **RVFI 資訊補全**：若開啟 RVFI 模式，會記錄指令執行前的 rs1/rs2 值，幫助外部工具驗證指令正確性。
+2. **Commit 輸出邏輯**：將 ROB 中對應條目的指令輸出給 commit 階段。
+3. **Flush 機制**：紀錄並追蹤每次 branch mispredict 所需 flush 的指令數量，並根據 commit 狀態清除該紀錄。
+4. **時脈邊緣更新機制**：確保 flush flag 和 flush entry 數量跨週期正確保存。
+5. **Flush 數量統計**：將所有需 flush 的條目加總供後續單元參考。
+
+此邏輯確保當分支預測錯誤時，能夠正確識別哪些指令需要清除並避免非法寫回。
+
+
