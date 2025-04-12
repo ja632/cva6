@@ -834,3 +834,132 @@ end
 ✅ `rr_arb_tree` 的作用是優雅選出最新資料來源，若之後要視覺化其運作或補充圖解，也可以幫你補上。
 
 ---
+
+### issue_read_operands module
+
+---
+
+// ======================================================================================================
+// 🔍 Module Overview: issue_read_operands
+// ======================================================================================================
+// issue_read_operands 模組的目的是在發射階段 (issue stage) 處理運算元讀取與功能單元派發（Functional Unit Dispatch）。
+// 它負責：
+//   1. 發出指令的運算元資料 forwarding（支援 GPR / FPR）
+//   2. FU readiness 判斷 & 指令送往對應功能單元
+//   3. 實作 bypassing / forwarding 資料路徑
+//   4. 處理壓縮指令、LSU、FPU、ALU 等多種功能單元輸出
+//   5. 記錄物理暫存器對應資訊供後續使用
+//   6. 避免 hazard（結構/資料）透過 FU readiness 和 reg clobber 判斷
+//
+// 通常與 ROB、Scoreboard、FU 整合使用。
+
+module issue_read_operands
+  import ariane_pkg::*;
+#(
+    parameter config_pkg::cva6_cfg_t CVA6Cfg = config_pkg::cva6_cfg_empty,
+    parameter type rs3_len_t = logic
+) (
+    // 🔁 Clock & Reset
+    input  logic clk_i,
+    input  logic rst_ni,
+    input  logic flush_i,              // flush pipeline
+    input  logic stall_i,              // stall current issue pipeline
+
+    // 🧾 Issue interface from ROB
+    input  scoreboard_entry_t [CVA6Cfg.NrissuePorts-1:0] issue_instr_i,
+    input  logic [CVA6Cfg.NrissuePorts-1:0] issue_instr_valid_i,
+    output logic [CVA6Cfg.NrissuePorts-1:0] issue_ack_o,
+
+    // 🧮 Operand physical index output (for scoreboard or FU)
+    output logic [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-1:0] rs1_o,
+    output logic [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-1:0] rs2_o,
+    output logic [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-1:0] rs3_o,
+
+    // 🧮 Operand value input (forwarded data)
+    input  riscv::xlen_t [CVA6Cfg.NrissuePorts-1:0] rs1_i,
+    input  riscv::xlen_t [CVA6Cfg.NrissuePorts-1:0] rs2_i,
+    input  rs3_len_t     [CVA6Cfg.NrissuePorts-1:0] rs3_i,
+
+    // ✅ Operand valid signals (是否 forwarding 成功)
+    input  logic [CVA6Cfg.NrissuePorts-1:0] rs1_valid_i,
+    input  logic [CVA6Cfg.NrissuePorts-1:0] rs2_valid_i,
+    input  logic [CVA6Cfg.NrissuePorts-1:0] rs3_valid_i,
+
+    // ⛔ Register clobber 記錄（預測是否 register value 會被覆寫）
+    input  fu_t [2**REG_ADDR_SIZE-1:0] rd_clobber_gpr_i,
+    input  fu_t [2**REG_ADDR_SIZE-1:0] rd_clobber_fpr_i,
+
+    // 🔄 Forwarding path output (立即提供 rs1 / rs2 給後續模組)
+    output riscv::xlen_t [CVA6Cfg.NrissuePorts-1:0] rs1_forwarding_o,
+    output riscv::xlen_t [CVA6Cfg.NrissuePorts-1:0] rs2_forwarding_o,
+
+    // 📤 FU dispatch 資料
+    output fu_data_t [CVA6Cfg.NrissuePorts-1:0] fu_data_o,
+    output logic   [CVA6Cfg.NrissuePorts-1:0][riscv::VLEN-1:0] pc_o,
+    output logic   [CVA6Cfg.NrissuePorts-1:0] is_compressed_instr_o,
+
+    // ✅ Functional Unit Ready Input (確認是否可接收新指令)
+    input  logic alu0_ready_i,
+    input  logic alu1_ready_i,
+    input  logic bu_ready_i,
+    input  logic csr_ready_i,
+    input  logic mult0_ready_i,
+    input  logic mult1_ready_i,
+    input  logic lsu_ready_i,
+    input  logic fpu_ready_i,
+
+    // 📬 Functional Unit Valid Output (送指令至 ALU/LSU/FPU...)
+    output logic alu0_valid_o,
+    output logic alu1_valid_o,
+    output logic branch_valid_o,
+    output branchpredict_sbe_t branch_predict_o,
+    output logic lsu_valid_o,
+    output logic mult0_valid_o,
+    output logic mult1_valid_o,
+    output logic fpu_valid_o,
+    output logic [1:0] fpu_fmt_o,
+    output logic [2:0] fpu_rm_o,
+    output logic csr_valid_o,
+
+    // 🧩 CVXIF 外部加速器支援
+    output logic cvxif_valid_o,
+    input  logic cvxif_ready_i,
+    output logic [31:0] cvxif_off_instr_o,
+
+    // 📌 Register File Writeback 資訊
+    input  logic [CVA6Cfg.NrCommitPorts-1:0][REG_ADDR_SIZE-1:0]  virtual_waddr_i,
+    input  logic [CVA6Cfg.NrCommitPorts-1:0][REG_ADDR_SIZE-1:0]  physical_waddr_i,
+    output logic [CVA6Cfg.NrCommitPorts-1:0][REG_ADDR_SIZE-1:0]  waddr_final,
+    input  logic [CVA6Cfg.NrCommitPorts-1:0][riscv::XLEN-1:0]    wdata_i,
+    input  logic [CVA6Cfg.NrCommitPorts-1:0]                     we_gpr_i,
+    input  logic [CVA6Cfg.NrCommitPorts-1:0]                     we_fpr_i,
+
+    // 📇 Register Mapping 輸出（實體 index）
+    output logic [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-1:0]   rs1_physical_o,
+    output logic [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-1:0]   rs2_physical_o,
+    output logic [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-1:0]   rs3_physical_o,
+    input  logic [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-2:0]   rs1_physical_i,
+    input  logic [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-2:0]   rs2_physical_i,
+    input  logic [CVA6Cfg.NrissuePorts-1:0][REG_ADDR_SIZE-2:0]   rs3_physical_i,
+
+    // 🚦 Stall 回報給外部（e.g. scoreboard）
+    output logic stall_issue_o
+);
+```
+
+---
+
+### 📘 模組說明摘要：`issue_read_operands`
+
+| 功能類別         | 說明 |
+|------------------|------|
+| **運算元取得**   | 取得 RS1/RS2/RS3 實體編號與對應的運算值，支援 forwarding 路徑處理。
+| **功能單元派發** | 根據指令類型送往對應 FU（ALU0/ALU1/LSU/FPU/Branch/CSR）
+| **Ready 判斷**    | 檢查是否有可用資源發射當前指令
+| **壓縮指令支援** | 輸出是否為壓縮指令（is_compressed_instr_o）供後續使用
+| **CVXIF 支援**    | 可將特殊指令送往外部協處理器（Custom Instruction）
+| **Hazard 管控**  | 透過 clobber 資訊與 valid flag 避免 hazard
+
+這個模組是整個 Out-of-Order pipeline 的一個關鍵，負責在 rename 與 execute 間銜接，處理最複雜的運算元資料通路。
+
+
